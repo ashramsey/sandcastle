@@ -61,7 +61,7 @@
  * instead of `docker`). Everything else is identical.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSandbox } from "@ai-hero/sandcastle";
@@ -75,6 +75,16 @@ if (!IMAGE) {
   );
 }
 
+// The throwaway repo MUST live on a path the container runtime shares with the
+// host, or the bind mounts are empty inside the container and every git command
+// fails with "not a git repository" — which would make the write-rejection
+// checks pass for the WRONG reason. On macOS, Docker Desktop does NOT share the
+// default temp dir (`/var/folders/...` via os.tmpdir()), but does share
+// `/private` (so `/tmp` works). Default accordingly; override with VERIFY_REPO_BASE.
+const REPO_BASE =
+  process.env.VERIFY_REPO_BASE ??
+  (process.platform === "darwin" ? "/tmp" : tmpdir());
+
 // The gate is read on the HOST at mount-resolution time, so it is controlled by
 // this process's env — set SANDCASTLE_ALLOW_GIT_CONFIG_WRITES here, not inside.
 const hardened = process.env.SANDCASTLE_ALLOW_GIT_CONFIG_WRITES == null;
@@ -87,7 +97,11 @@ console.log(
 );
 
 // --- throwaway repo with a single seed commit ---
-const repo = mkdtempSync(join(tmpdir(), "sc-verify-"));
+// realpath so the host path matches git's canonical worktree gitdir pointer AND
+// the container mount path (on macOS /tmp is a symlink to /private/tmp; a raw
+// /tmp path would be mounted while git writes /private/tmp into .git, breaking
+// worktree resolution inside the container).
+const repo = realpathSync(mkdtempSync(join(REPO_BASE, "sc-verify-")));
 const hostGit = (args: string[]) =>
   execFileSync("git", args, { cwd: repo, stdio: "pipe" });
 hostGit(["init", "-q", "-b", "main"]);
@@ -120,6 +134,19 @@ try {
     'git config --global --add safe.directory "$(pwd)" && ' +
       "git config --global user.email a@b.c && git config --global user.name A",
   );
+
+  // Preflight: the repo MUST resolve inside the container. If it doesn't (broken
+  // bind mount — usually a non-shared host path), a config write would "fail"
+  // for the wrong reason and the checks below would be meaningless. Fail loudly.
+  const topLevel = await sandbox.exec("git rev-parse --show-toplevel");
+  if (topLevel.exitCode !== 0) {
+    throw new Error(
+      `Repo did not resolve inside the container (exit ${topLevel.exitCode}: ` +
+        `${topLevel.stderr.trim()}).\nThe throwaway repo at ${repo} is likely on a ` +
+        `path the container runtime does not share. Set VERIFY_REPO_BASE to a ` +
+        `shared path (e.g. under /Users or /tmp) and retry.`,
+    );
+  }
 
   // (1) repo-local config writes — the injection surface.
   const hooksWrite = await sandbox.exec(
