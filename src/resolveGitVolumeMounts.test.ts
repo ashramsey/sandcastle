@@ -20,19 +20,42 @@ describe("resolveGitMounts", () => {
     dirs.length = 0;
   });
 
-  const run = (gitPath: string) =>
+  // Default `hardenGitConfig` is env-gated (SANDCASTLE_ALLOW_GIT_CONFIG_WRITES);
+  // pass the flag explicitly so these cases are independent of the ambient env.
+  const run = (gitPath: string, hardenGitConfig = true) =>
     Effect.runPromise(
-      resolveGitMounts(gitPath).pipe(Effect.provide(NodeFileSystem.layer)),
+      resolveGitMounts(gitPath, hardenGitConfig).pipe(
+        Effect.provide(NodeFileSystem.layer),
+      ),
     );
 
-  it("returns git dir + read-only hooks mount when .git is a directory", async () => {
+  it("returns git dir + read-only hooks and config mounts when .git is a directory", async () => {
     const repoDir = await makeTempDir();
     const gitDir = join(repoDir, ".git");
     await mkdir(gitDir);
     const hooksDir = join(gitDir, "hooks");
     await mkdir(hooksDir);
+    const configFile = join(gitDir, "config");
+    await writeFile(configFile, "[core]\n");
 
     const mounts = await run(gitDir);
+
+    expect(mounts).toEqual([
+      { hostPath: gitDir, sandboxPath: gitDir },
+      { hostPath: hooksDir, sandboxPath: hooksDir, readonly: true },
+      { hostPath: configFile, sandboxPath: configFile, readonly: true },
+    ]);
+  });
+
+  it("omits the config mount when hardenGitConfig is false (trusted opt-out)", async () => {
+    const repoDir = await makeTempDir();
+    const gitDir = join(repoDir, ".git");
+    await mkdir(gitDir);
+    const hooksDir = join(gitDir, "hooks");
+    await mkdir(hooksDir);
+    await writeFile(join(gitDir, "config"), "[core]\n");
+
+    const mounts = await run(gitDir, false);
 
     expect(mounts).toEqual([
       { hostPath: gitDir, sandboxPath: gitDir },
@@ -40,7 +63,7 @@ describe("resolveGitMounts", () => {
     ]);
   });
 
-  it("omits the hooks mount when the hooks dir does not exist", async () => {
+  it("omits the hooks and config mounts when neither exists", async () => {
     const repoDir = await makeTempDir();
     const gitDir = join(repoDir, ".git");
     await mkdir(gitDir);
@@ -50,7 +73,7 @@ describe("resolveGitMounts", () => {
     expect(mounts).toEqual([{ hostPath: gitDir, sandboxPath: gitDir }]);
   });
 
-  it("returns both mounts when .git is a worktree file", async () => {
+  it("returns parent git + read-only hooks and config mounts when .git is a worktree file", async () => {
     const parentRepoDir = await makeTempDir();
     const parentGitDir = join(parentRepoDir, ".git");
     await mkdir(parentGitDir);
@@ -60,6 +83,8 @@ describe("resolveGitMounts", () => {
 
     const hooksDir = join(parentGitDir, "hooks");
     await mkdir(hooksDir);
+    const configFile = join(parentGitDir, "config");
+    await writeFile(configFile, "[core]\n");
 
     const worktreeDir = await makeTempDir();
     const gitFile = join(worktreeDir, ".git");
@@ -71,6 +96,7 @@ describe("resolveGitMounts", () => {
       { hostPath: gitFile, sandboxPath: gitFile },
       { hostPath: parentGitDir, sandboxPath: parentGitDir },
       { hostPath: hooksDir, sandboxPath: hooksDir, readonly: true },
+      { hostPath: configFile, sandboxPath: configFile, readonly: true },
     ]);
   });
 

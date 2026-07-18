@@ -259,12 +259,44 @@ export interface MountEntry {
 }
 
 /**
+ * Environment variable that opts a run out of the read-only `.git/config`
+ * hardening (ticket harden/git-config-injection-vector, F1 follow-up). Set it to
+ * a truthy value (`1`, `true`, `yes`, `on`) for a *trusted* workflow that needs
+ * to write repo-local git config from inside the sandbox — `git remote add`,
+ * `git config --local`, or tracking-branch creation (`git push -u`,
+ * `git checkout --track`). Unset (the default) keeps `.git/config` read-only.
+ */
+export const ALLOW_GIT_CONFIG_WRITES_ENV = "SANDCASTLE_ALLOW_GIT_CONFIG_WRITES";
+
+const TRUTHY_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
+
+/**
+ * Whether the read-only `.git/config` hardening is active for this process.
+ * Hardened by default; disabled only when {@link ALLOW_GIT_CONFIG_WRITES_ENV} is
+ * set to a truthy value. Exported (and env-injectable) so the mount resolution
+ * is unit-testable without mutating `process.env`.
+ */
+export const gitConfigHardeningEnabled = (
+  env: NodeJS.ProcessEnv = process.env,
+): boolean =>
+  !TRUTHY_ENV_VALUES.has(
+    (env[ALLOW_GIT_CONFIG_WRITES_ENV] ?? "").trim().toLowerCase(),
+  );
+
+/**
  * Resolves the git-related mounts needed for the sandbox.
  * Handles both normal repos (where .git is a directory) and worktrees
  * (where .git is a file pointing to the parent repo's .git/worktrees/<name>).
+ *
+ * @param hardenGitConfig - When true (the default, gated by
+ *   {@link gitConfigHardeningEnabled}), layer a read-only mount over
+ *   `<gitDir>/config` so a prompt-injected agent cannot write code-executing
+ *   entries there. Trusted workflows opt out via
+ *   {@link ALLOW_GIT_CONFIG_WRITES_ENV}.
  */
 export const resolveGitMounts = (
   gitPath: string,
+  hardenGitConfig: boolean = gitConfigHardeningEnabled(),
 ): Effect.Effect<MountEntry[], PlatformError, FileSystem.FileSystem> =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -286,11 +318,43 @@ export const resolveGitMounts = (
           : [];
       });
 
+    // A read-only bind mount of `<gitDir>/config`, closing the sibling of the
+    // hooks vector (ticket harden/git-config-injection-vector, F1 follow-up).
+    // Every exec-capable git mechanism's *command* lives in config —
+    // `core.hooksPath` / `core.fsmonitor`, an executable `alias.* = !cmd`, an
+    // external diff/merge/filter driver, `credential.helper`, `core.pager`,
+    // `sequence.editor`, and the `extensions.worktreeConfig` escalation. h01
+    // neutralizes these for sandcastle's *own* host git, but the developer's
+    // later *manual* `git` still reads `.git/config` and runs them as the
+    // developer. Locking the file read-only prevents the write entirely.
+    //
+    // File permissions alone do NOT suffice: git rewrites config via a
+    // `config.lock` + rename() over the file, which needs only *directory* write
+    // permission, so a `chmod 0444` config is still replaced. A bind mount makes
+    // the path a mountpoint, so the rename() fails (EBUSY/EXDEV) and the write is
+    // rejected loudly. Commits are unaffected — they touch objects/refs, not
+    // config, and identity comes from `--global` config in the sandbox home.
+    // Gated by `hardenGitConfig` so trusted workflows can opt out. Returned only
+    // when the config file exists, so a bare git dir doesn't fail with a missing
+    // bind-mount source.
+    const configMount = (
+      gitDir: string,
+    ): Effect.Effect<MountEntry[], PlatformError, FileSystem.FileSystem> =>
+      Effect.gen(function* () {
+        if (!hardenGitConfig) return [];
+        const configPath = join(gitDir, "config");
+        const exists = yield* fs.exists(configPath);
+        return exists
+          ? [{ hostPath: configPath, sandboxPath: configPath, readonly: true }]
+          : [];
+      });
+
     const stat = yield* fs.stat(gitPath);
     if (stat.type === "Directory") {
       return [
         { hostPath: gitPath, sandboxPath: gitPath },
         ...(yield* hooksMount(gitPath)),
+        ...(yield* configMount(gitPath)),
       ];
     }
     // Worktree: .git is a file with "gitdir: <path>"
@@ -302,12 +366,15 @@ export const resolveGitMounts = (
     }
     const gitdirPath = match[1]!;
     // gitdirPath is like /path/to/repo/.git/worktrees/<name>
-    // Mount both the .git file and the parent .git directory
+    // Mount both the .git file and the parent .git directory. The shared
+    // `config` lives in the parent git dir (worktrees inherit it), so harden it
+    // there.
     const parentGitDir = resolve(gitdirPath, "..", "..");
     return [
       { hostPath: gitPath, sandboxPath: gitPath },
       { hostPath: parentGitDir, sandboxPath: parentGitDir },
       ...(yield* hooksMount(parentGitDir)),
+      ...(yield* configMount(parentGitDir)),
     ];
   });
 
