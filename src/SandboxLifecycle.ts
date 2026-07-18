@@ -13,6 +13,7 @@ import {
   type SandboxError,
 } from "./errors.js";
 import { type ExecResult, type SandboxService } from "./SandboxFactory.js";
+import { neutralizeHostGitCommand } from "./hostGit.js";
 import type { Timeouts } from "./run.js";
 import { countCommitsToSync } from "./syncOut.js";
 
@@ -201,7 +202,7 @@ export const withSandboxLifecycle = <A>(
     const hostCurrentBranch: string | null = !branch
       ? yield* Effect.promise(async () => {
           const { stdout } = await execAsync(
-            "git rev-parse --abbrev-ref HEAD",
+            neutralizeHostGitCommand("rev-parse --abbrev-ref HEAD"),
             { cwd: hostRepoDir },
           );
           return stdout.trim();
@@ -211,10 +212,14 @@ export const withSandboxLifecycle = <A>(
     // Read host git identity before entering the sandbox
     const [hostGitName, hostGitEmail] = yield* Effect.promise(async () => {
       const [nameResult, emailResult] = await Promise.all([
-        execAsync("git config user.name", { cwd: hostRepoDir })
+        execAsync(neutralizeHostGitCommand("config user.name"), {
+          cwd: hostRepoDir,
+        })
           .then((r) => r.stdout.trim())
           .catch(() => ""),
-        execAsync("git config user.email", { cwd: hostRepoDir })
+        execAsync(neutralizeHostGitCommand("config user.email"), {
+          cwd: hostRepoDir,
+        })
           .then((r) => r.stdout.trim())
           .catch(() => ""),
       ]);
@@ -373,9 +378,12 @@ export const withSandboxLifecycle = <A>(
     // the host-side SHA is the correct baseline for git rev-list after applyToHost
     // syncs commits back (syncOut creates new SHAs via format-patch/am).
     const baseHead = yield* Effect.promise(async () => {
-      const { stdout } = await execAsync("git rev-parse HEAD", {
-        cwd: hostSideWorktreePath,
-      });
+      const { stdout } = await execAsync(
+        neutralizeHostGitCommand("rev-parse HEAD"),
+        {
+          cwd: hostSideWorktreePath,
+        },
+      );
       return stdout.trim();
     });
 
@@ -416,7 +424,7 @@ export const withSandboxLifecycle = <A>(
       const hasNewCommits = yield* Effect.promise(async () => {
         try {
           const { stdout } = await execAsync(
-            `git rev-list "${baseHead}..HEAD" --count`,
+            neutralizeHostGitCommand(`rev-list "${baseHead}..HEAD" --count`),
             { cwd: hostSideWorktreePath },
           );
           return parseInt(stdout.trim(), 10) > 0;
@@ -440,9 +448,12 @@ export const withSandboxLifecycle = <A>(
           Effect.tryPromise({
             try: async () => {
               try {
-                await execAsync(`git merge "${resolvedBranch}"`, {
-                  cwd: hostRepoDir,
-                });
+                await execAsync(
+                  neutralizeHostGitCommand(`merge "${resolvedBranch}"`),
+                  {
+                    cwd: hostRepoDir,
+                  },
+                );
               } catch {
                 throw new Error(
                   `Merge of '${resolvedBranch}' onto '${hostCurrentBranch}' failed. ` +
@@ -476,7 +487,7 @@ export const withSandboxLifecycle = <A>(
       // branch and the worktree's lifetime outlives the lifecycle.
       if (!options.keepSourceBranch) {
         yield* Effect.promise(() =>
-          execAsync(`git branch -D "${resolvedBranch}"`, {
+          execAsync(neutralizeHostGitCommand(`branch -D "${resolvedBranch}"`), {
             cwd: hostRepoDir,
           }).catch(() => {}),
         );

@@ -25,7 +25,22 @@ describe("resolveGitMounts", () => {
       resolveGitMounts(gitPath).pipe(Effect.provide(NodeFileSystem.layer)),
     );
 
-  it("returns single mount when .git is a directory", async () => {
+  it("returns git dir + read-only hooks mount when .git is a directory", async () => {
+    const repoDir = await makeTempDir();
+    const gitDir = join(repoDir, ".git");
+    await mkdir(gitDir);
+    const hooksDir = join(gitDir, "hooks");
+    await mkdir(hooksDir);
+
+    const mounts = await run(gitDir);
+
+    expect(mounts).toEqual([
+      { hostPath: gitDir, sandboxPath: gitDir },
+      { hostPath: hooksDir, sandboxPath: hooksDir, readonly: true },
+    ]);
+  });
+
+  it("omits the hooks mount when the hooks dir does not exist", async () => {
     const repoDir = await makeTempDir();
     const gitDir = join(repoDir, ".git");
     await mkdir(gitDir);
@@ -43,6 +58,9 @@ describe("resolveGitMounts", () => {
       recursive: true,
     });
 
+    const hooksDir = join(parentGitDir, "hooks");
+    await mkdir(hooksDir);
+
     const worktreeDir = await makeTempDir();
     const gitFile = join(worktreeDir, ".git");
     await writeFile(gitFile, `gitdir: ${parentGitDir}/worktrees/my-worktree\n`);
@@ -52,6 +70,7 @@ describe("resolveGitMounts", () => {
     expect(mounts).toEqual([
       { hostPath: gitFile, sandboxPath: gitFile },
       { hostPath: parentGitDir, sandboxPath: parentGitDir },
+      { hostPath: hooksDir, sandboxPath: hooksDir, readonly: true },
     ]);
   });
 

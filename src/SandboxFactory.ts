@@ -254,6 +254,8 @@ const attachPreservedPath = <E>(
 export interface MountEntry {
   readonly hostPath: string;
   readonly sandboxPath: string;
+  /** Mount as read-only. Defaults to `false`. */
+  readonly readonly?: boolean;
 }
 
 /**
@@ -266,9 +268,30 @@ export const resolveGitMounts = (
 ): Effect.Effect<MountEntry[], PlatformError, FileSystem.FileSystem> =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
+
+    // A read-only bind mount of `<gitDir>/hooks` layered over the writable git
+    // dir, so a prompt-injected agent cannot drop a hook script that later runs
+    // on the host (ticket harden/git-hook-host-execution, F1). The parent git
+    // dir stays writable so the agent can still commit (objects/refs); only
+    // `hooks/` is locked down. Returned only when the hooks dir exists, so a repo
+    // without one doesn't fail with a missing bind-mount source.
+    const hooksMount = (
+      gitDir: string,
+    ): Effect.Effect<MountEntry[], PlatformError, FileSystem.FileSystem> =>
+      Effect.gen(function* () {
+        const hooksPath = join(gitDir, "hooks");
+        const exists = yield* fs.exists(hooksPath);
+        return exists
+          ? [{ hostPath: hooksPath, sandboxPath: hooksPath, readonly: true }]
+          : [];
+      });
+
     const stat = yield* fs.stat(gitPath);
     if (stat.type === "Directory") {
-      return [{ hostPath: gitPath, sandboxPath: gitPath }];
+      return [
+        { hostPath: gitPath, sandboxPath: gitPath },
+        ...(yield* hooksMount(gitPath)),
+      ];
     }
     // Worktree: .git is a file with "gitdir: <path>"
     const content = (yield* fs.readFileString(gitPath)).trim();
@@ -284,6 +307,7 @@ export const resolveGitMounts = (
     return [
       { hostPath: gitPath, sandboxPath: gitPath },
       { hostPath: parentGitDir, sandboxPath: parentGitDir },
+      ...(yield* hooksMount(parentGitDir)),
     ];
   });
 
