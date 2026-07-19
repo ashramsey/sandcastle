@@ -498,7 +498,9 @@ export const withSandboxLifecycle = <A>(
         Effect.promise(async () => {
           try {
             const { stdout } = await execAsync(
-              `git rev-list "${baseHead}..HEAD" --reverse`,
+              neutralizeHostGitCommand(
+                `rev-list "${baseHead}..HEAD" --reverse`,
+              ),
               { cwd: hostRepoDir },
             );
             const lines = stdout.trim();
@@ -526,7 +528,9 @@ export const withSandboxLifecycle = <A>(
         Effect.promise(async () => {
           try {
             const { stdout } = await execAsync(
-              `git rev-list "${baseHead}..refs/heads/${targetBranch}" --reverse`,
+              neutralizeHostGitCommand(
+                `rev-list "${baseHead}..refs/heads/${targetBranch}" --reverse`,
+              ),
               { cwd: hostRepoDir },
             );
             const lines = stdout.trim();
