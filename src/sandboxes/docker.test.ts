@@ -138,6 +138,59 @@ describe("docker()", () => {
     expect(provider.tag).toBe("bind-mount");
   });
 
+  describe("egress control — emitted --network flags (h03)", () => {
+    const runDocker = async (options?: Parameters<typeof docker>[0]) => {
+      mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
+        const callback = rest[rest.length - 1];
+        callback(null, "", "");
+        return undefined as any;
+      });
+      const provider = docker(options);
+      const handle = await provider.create({
+        worktreePath: "/tmp/worktree",
+        hostRepoPath: "/tmp/repo",
+        mounts: [
+          { hostPath: "/tmp/worktree", sandboxPath: "/home/agent/workspace" },
+        ],
+        env: {},
+      });
+      const runArgs = mockExecFile.mock.calls.find(
+        ([, args]) => Array.isArray(args) && args[0] === "run",
+      )?.[1] as string[];
+      await handle.close();
+      return runArgs;
+    };
+
+    it("emits no --network flag when network is omitted (default bridge)", async () => {
+      const runArgs = await runDocker();
+      expect(runArgs).not.toContain("--network");
+    });
+
+    it("emits --network for a custom egress-proxy network (string)", async () => {
+      const runArgs = await runDocker({ network: "egress-internal" });
+      const idx = runArgs.indexOf("--network");
+      expect(idx).toBeGreaterThan(-1);
+      expect(runArgs[idx + 1]).toBe("egress-internal");
+    });
+
+    it("emits multiple --network flags for an array in order", async () => {
+      const runArgs = await runDocker({ network: ["net1", "net2"] });
+      const firstIdx = runArgs.indexOf("--network");
+      expect(firstIdx).toBeGreaterThan(-1);
+      expect(runArgs[firstIdx + 1]).toBe("net1");
+      const secondIdx = runArgs.indexOf("--network", firstIdx + 1);
+      expect(secondIdx).toBeGreaterThan(-1);
+      expect(runArgs[secondIdx + 1]).toBe("net2");
+    });
+
+    it("emits --network none for the fully-offline posture", async () => {
+      const runArgs = await runDocker({ network: "none" });
+      const idx = runArgs.indexOf("--network");
+      expect(idx).toBeGreaterThan(-1);
+      expect(runArgs[idx + 1]).toBe("none");
+    });
+  });
+
   describe("host-access gate (h06)", () => {
     it("throws at construction for a host-access hatch without the ack flag", () => {
       expect(() => docker({ network: "host" })).toThrow(

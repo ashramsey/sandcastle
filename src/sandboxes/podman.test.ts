@@ -490,6 +490,60 @@ describe("podman()", () => {
     await handle.close();
   });
 
+  it("passes --network none for the fully-offline posture", async () => {
+    mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
+      const callback = rest[rest.length - 1];
+      callback(null, "", "");
+      return undefined as any;
+    });
+
+    const provider = podman({ network: "none" });
+    const handle = await provider.create({
+      worktreePath: "/tmp/worktree",
+      hostRepoPath: "/tmp/repo",
+      mounts: [
+        { hostPath: "/tmp/worktree", sandboxPath: "/home/agent/workspace" },
+      ],
+      env: {},
+    });
+
+    const runArgs = mockExecFile.mock.calls.find(
+      ([, args]) => Array.isArray(args) && args[0] === "run",
+    )?.[1] as string[];
+
+    const idx = runArgs.indexOf("--network");
+    expect(idx).toBeGreaterThan(-1);
+    expect(runArgs[idx + 1]).toBe("none");
+
+    await handle.close();
+  });
+
+  it("emits no --network flag when network is omitted (default bridge)", async () => {
+    mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
+      const callback = rest[rest.length - 1];
+      callback(null, "", "");
+      return undefined as any;
+    });
+
+    const provider = podman();
+    const handle = await provider.create({
+      worktreePath: "/tmp/worktree",
+      hostRepoPath: "/tmp/repo",
+      mounts: [
+        { hostPath: "/tmp/worktree", sandboxPath: "/home/agent/workspace" },
+      ],
+      env: {},
+    });
+
+    const runArgs = mockExecFile.mock.calls.find(
+      ([, args]) => Array.isArray(args) && args[0] === "run",
+    )?.[1] as string[];
+
+    expect(runArgs).not.toContain("--network");
+
+    await handle.close();
+  });
+
   it("passes --group-add flags to podman run, stringifying numeric GIDs", async () => {
     mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
       const callback = rest[rest.length - 1];
