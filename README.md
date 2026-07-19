@@ -65,7 +65,7 @@ await run({
 
 ## Sandbox Providers
 
-Sandcastle uses a `SandboxProvider` to create isolated environments. The `sandbox` option on `run()`, `interactive()`, and `createSandbox()` accepts any provider, including `noSandbox()` — opt in to running the agent directly on the host when container isolation is undesired. Built-in providers:
+Sandcastle uses a `SandboxProvider` to create isolated environments. The `sandbox` option on `run()`, `interactive()`, and `createSandbox()` is **required** — there is no silent default. Pass a real provider (e.g. `docker()`), or an explicit `noSandbox()` to deliberately run the agent directly on the host when container isolation is undesired. Omitting `sandbox` throws, so running unsandboxed is always a conscious choice. Built-in providers:
 
 | Provider   | Import path                                | Type       | Accepted by                                 |
 | ---------- | ------------------------------------------ | ---------- | ------------------------------------------- |
@@ -74,7 +74,7 @@ Sandcastle uses a `SandboxProvider` to create isolated environments. The `sandbo
 | Vercel     | `@ai-hero/sandcastle/sandboxes/vercel`     | Isolated   | `run()`, `createSandbox()`, `interactive()` |
 | No-sandbox | `@ai-hero/sandcastle/sandboxes/no-sandbox` | None       | `run()`, `createSandbox()`, `interactive()` |
 
-Worktree methods (`wt.run()`, `wt.interactive()`, `wt.createSandbox()`) accept the same providers as their top-level counterparts. `wt.interactive()` defaults to `noSandbox()` when no sandbox is specified.
+Worktree methods (`wt.run()`, `wt.interactive()`, `wt.createSandbox()`) accept the same providers as their top-level counterparts and, like them, all **require** an explicit `sandbox` — including `wt.interactive()`, which used to fall back to `noSandbox()`. Pass an explicit `noSandbox()` to keep running host-direct.
 
 **Bind-mount hardening.** The bind-mount providers (Docker, Podman) mount the host repo's `.git/hooks` and `.git/config` **read-only** so a prompt-injected agent cannot plant a git hook or a code-executing config entry (`core.hooksPath`, an executable `alias`, an external diff/filter driver, etc.) that would later run as the developer on the host. Commits are unaffected — they write objects and refs, not hooks or config. This blocks in-sandbox repo-local config writes (`git remote add`, `git config --local`, tracking-branch creation); trusted workflows that need those can opt out by setting `SANDCASTLE_ALLOW_GIT_CONFIG_WRITES=1`.
 
@@ -453,9 +453,11 @@ await using wt = await createWorktree({
 console.log(wt.worktreePath); // host path to the worktree
 console.log(wt.branch); // "agent/fix-42"
 
-// Run an interactive session in the worktree (defaults to noSandbox)
+// Run an interactive session in the worktree (sandbox is required —
+// pass an explicit noSandbox() to run host-direct)
 await wt.interactive({
   agent: claudeCode("claude-opus-4-8"),
+  sandbox: noSandbox(),
   prompt: "Explore the codebase and understand the bug.",
 });
 
