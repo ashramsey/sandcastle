@@ -406,6 +406,31 @@ describe("podman()", () => {
     expect(provider.tag).toBe("bind-mount");
   });
 
+  describe("host-access gate (h06)", () => {
+    it("throws at construction for a host-access hatch without the ack flag", () => {
+      expect(() => podman({ network: "host" })).toThrow(
+        /allowDangerousHostAccess: true/,
+      );
+      expect(() => podman({ groups: ["docker"] })).toThrow(
+        /allowDangerousHostAccess: true/,
+      );
+      expect(() => podman({ devices: ["/dev/kvm"] })).toThrow(
+        /allowDangerousHostAccess: true/,
+      );
+    });
+
+    it("does NOT gate a custom network or network: 'none'", () => {
+      expect(() => podman({ network: "my-egress-proxy" })).not.toThrow();
+      expect(() => podman({ network: "none" })).not.toThrow();
+    });
+
+    it("allows the hatch when allowDangerousHostAccess is set", () => {
+      expect(() =>
+        podman({ devices: ["/dev/kvm"], allowDangerousHostAccess: true }),
+      ).not.toThrow();
+    });
+  });
+
   it("passes --network flag when network is a string", async () => {
     mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
       const callback = rest[rest.length - 1];
@@ -472,7 +497,10 @@ describe("podman()", () => {
       return undefined as any;
     });
 
-    const provider = podman({ groups: ["docker", 999] });
+    const provider = podman({
+      groups: ["docker", 999],
+      allowDangerousHostAccess: true,
+    });
     const handle = await provider.create({
       worktreePath: "/tmp/worktree",
       hostRepoPath: "/tmp/repo",
@@ -529,7 +557,10 @@ describe("podman()", () => {
       return undefined as any;
     });
 
-    const provider = podman({ devices: ["/dev/kvm", "/dev/fuse"] });
+    const provider = podman({
+      devices: ["/dev/kvm", "/dev/fuse"],
+      allowDangerousHostAccess: true,
+    });
     const handle = await provider.create({
       worktreePath: "/tmp/worktree",
       hostRepoPath: "/tmp/repo",

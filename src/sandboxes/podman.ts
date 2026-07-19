@@ -36,6 +36,7 @@ import {
   resolveHardeningFlags,
   type RunHardeningOptions,
 } from "../runHardening.js";
+import { assertHostAccessAcknowledged } from "./hostAccessGate.js";
 
 export interface PodmanOptions {
   /** Podman image name (default: derived from repo directory name). */
@@ -86,7 +87,18 @@ export interface PodmanOptions {
    * - `"my-network"` → `--network my-network`
    * - `["net1", "net2"]` → `--network net1 --network net2`
    *
-   * When omitted, Podman's default network is used.
+   * When omitted, Podman's default network is used — which NATs outbound
+   * traffic, so the agent reaches `api.anthropic.com`, git hosts, and package
+   * registries out of the box. This is also the **egress-control lever**: route
+   * the container through a filtering-proxy / internal network to allowlist
+   * only the agent's real endpoints, or use `"none"` for a fully offline run
+   * (no model calls, installs, or remote git). See the README's egress section.
+   *
+   * ⚠️ `network: "host"` shares the **host's** network namespace, letting the
+   * agent reach host-bound services (localhost daemons, cloud metadata
+   * endpoints, sibling containers). It is a host-access escape hatch and
+   * requires {@link PodmanOptions.allowDangerousHostAccess}. Custom networks
+   * and `"none"` are **not** gated.
    */
   readonly network?: string | readonly string[];
   /**
@@ -98,8 +110,11 @@ export interface PodmanOptions {
    * - `[999]` → `--group-add 999`
    * - `["docker", 999]` → `--group-add docker --group-add 999`
    *
-   * Useful for granting access to a bind-mounted Docker socket (Docker-outside-of-Docker).
-   * When omitted, no `--group-add` flags are added.
+   * ⚠️ Host-access escape hatch. Adding the agent to a host group (e.g.
+   * `docker`, to reach a bind-mounted container-runtime socket for
+   * Docker-outside-of-Docker) grants host-level privilege and requires
+   * {@link PodmanOptions.allowDangerousHostAccess}. When omitted, no
+   * `--group-add` flags are added.
    */
   readonly groups?: readonly (string | number)[];
   /**
@@ -111,9 +126,11 @@ export interface PodmanOptions {
    * - `["/dev/sda:/dev/xvda:rwm"]` → `--device /dev/sda:/dev/xvda:rwm`
    * - `["/dev/kvm", "/dev/fuse"]` → `--device /dev/kvm --device /dev/fuse`
    *
-   * Under rootless Podman, exposing a host device often requires host-side
-   * group/permission setup and may interact with `--userns=keep-id`.
-   * When omitted, no `--device` flags are added.
+   * ⚠️ Host-access escape hatch. Exposing a host device hands the agent direct
+   * access to host hardware and requires
+   * {@link PodmanOptions.allowDangerousHostAccess}. Under rootless Podman it
+   * also often requires host-side group/permission setup and may interact with
+   * `--userns=keep-id`. When omitted, no `--device` flags are added.
    */
   readonly devices?: readonly string[];
   /**
@@ -143,6 +160,22 @@ export interface PodmanOptions {
    * default. Omit to accept the hardened defaults. See {@link RunHardeningOptions}.
    */
   readonly hardening?: RunHardeningOptions;
+  /**
+   * Acknowledge that the configured host-access escape hatch(es) grant the
+   * agent host-level access, unlocking them.
+   *
+   * The escape hatches — `network: "host"`, {@link PodmanOptions.groups},
+   * {@link PodmanOptions.devices}, and mounting the container-runtime socket
+   * via {@link PodmanOptions.mounts} — are legitimate opt-in features (GPU
+   * access, Docker-outside-of-Docker) but each punches a hole in the container
+   * boundary. Setting any of them **without** this flag throws at construction,
+   * so host access is never granted by accident. Set to `true` only when you
+   * intend that access and trust the workload: a prompt-injected agent could
+   * use these hatches to reach or take over the host.
+   *
+   * @default false
+   */
+  readonly allowDangerousHostAccess?: boolean;
 }
 
 /**
@@ -152,8 +185,13 @@ export interface PodmanOptions {
  * for the worktree and git directories. Calls the `podman` binary
  * on PATH directly. On macOS/Windows, verifies that a Podman Machine
  * is running before container creation.
+ *
+ * @throws if a host-access escape hatch (`network: "host"`, `groups`,
+ * `devices`, or a container-runtime-socket mount) is set without
+ * {@link PodmanOptions.allowDangerousHostAccess}.
  */
 export const podman = (options?: PodmanOptions): SandboxProvider => {
+  assertHostAccessAcknowledged("podman", options ?? {});
   const configuredImageName = options?.imageName;
   const selinuxLabel = options?.selinuxLabel ?? "z";
   const userns = options?.userns ?? "keep-id";

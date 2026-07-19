@@ -138,6 +138,65 @@ describe("docker()", () => {
     expect(provider.tag).toBe("bind-mount");
   });
 
+  describe("host-access gate (h06)", () => {
+    it("throws at construction for a host-access hatch without the ack flag", () => {
+      expect(() => docker({ network: "host" })).toThrow(
+        /allowDangerousHostAccess: true/,
+      );
+      expect(() => docker({ groups: ["docker"] })).toThrow(
+        /allowDangerousHostAccess: true/,
+      );
+      expect(() => docker({ devices: ["/dev/kvm"] })).toThrow(
+        /allowDangerousHostAccess: true/,
+      );
+    });
+
+    it("throws for a Docker-socket mount without the ack flag", () => {
+      expect(() =>
+        docker({
+          mounts: [
+            {
+              hostPath: "/var/run/docker.sock",
+              sandboxPath: "/var/run/docker.sock",
+            },
+          ],
+        }),
+      ).toThrow(/allowDangerousHostAccess: true/);
+    });
+
+    it("does NOT gate a custom network or network: 'none'", () => {
+      expect(() => docker({ network: "my-egress-proxy" })).not.toThrow();
+      expect(() => docker({ network: "none" })).not.toThrow();
+    });
+
+    it("allows the hatch when allowDangerousHostAccess is set", () => {
+      expect(() =>
+        docker({ network: "host", allowDangerousHostAccess: true }),
+      ).not.toThrow();
+    });
+
+    it("warns (but does not throw) on an acknowledged socket mount", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        expect(() =>
+          docker({
+            mounts: [
+              {
+                hostPath: "/var/run/docker.sock",
+                sandboxPath: "/var/run/docker.sock",
+              },
+            ],
+            allowDangerousHostAccess: true,
+          }),
+        ).not.toThrow();
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy.mock.calls[0]![0]).toContain("host root");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+  });
+
   it("passes --group-add flags to docker run, stringifying numeric GIDs", async () => {
     mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
       const callback = rest[rest.length - 1];
@@ -145,7 +204,10 @@ describe("docker()", () => {
       return undefined as any;
     });
 
-    const provider = docker({ groups: ["docker", 999] });
+    const provider = docker({
+      groups: ["docker", 999],
+      allowDangerousHostAccess: true,
+    });
     const handle = await provider.create({
       worktreePath: "/tmp/worktree",
       hostRepoPath: "/tmp/repo",
@@ -202,7 +264,10 @@ describe("docker()", () => {
       return undefined as any;
     });
 
-    const provider = docker({ devices: ["/dev/kvm", "/dev/fuse"] });
+    const provider = docker({
+      devices: ["/dev/kvm", "/dev/fuse"],
+      allowDangerousHostAccess: true,
+    });
     const handle = await provider.create({
       worktreePath: "/tmp/worktree",
       hostRepoPath: "/tmp/repo",

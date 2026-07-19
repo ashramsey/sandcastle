@@ -95,6 +95,8 @@ docker({ hardening: { capAdd: ["NET_BIND_SERVICE"], memory: "8g" } });
 
 **Secret redaction.** Injected credentials (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`) and user-declared secrets — env keys whose names look sensitive (`*_TOKEN`, `*_SECRET`, `*PASSWORD*`, `*API_KEY*`, and similar) — are masked with `[redacted]` before they are written to the verbose run log or to the captured session `.jsonl` transcripts on the host. This narrows the blast radius of a single leaked line persisted to disk. It is defense-in-depth, not a substitute for scoping tokens down to short-lived, least-privilege credentials.
 
+**Host-access escape hatches are gated.** A few provider options deliberately punch a hole in the container boundary — `network: "host"` (shares the host network namespace), `groups` (`--group-add`), `devices` (`--device`), and mounting the Docker/Podman socket via `mounts` (Docker-outside-of-Docker). These remain legitimate opt-in features (GPU access, DooD), but each grants the agent host-level access, so they are **inert unless you also pass `allowDangerousHostAccess: true`** — setting one without the acknowledgment throws at construction, so a prompt-injected agent can't reach the host through an option set by accident. Mounting the container-runtime socket additionally logs a runtime warning on every run; where DooD is genuinely needed, prefer a read-only socket-proxy over the raw socket. Custom/proxy networks and `network: "none"` are **not** gated — restricting egress is not a host-access hatch.
+
 ```typescript
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { podman } from "@ai-hero/sandcastle/sandboxes/podman";
@@ -171,16 +173,20 @@ const result = await run({
     selinuxLabel: "z",
     // Optional: provider-level env vars merged at launch time
     env: { DOCKER_SPECIFIC: "value" },
-    // Optional: attach container to Docker network(s) — string or string[]
-    network: "my-network",
-    // Optional: add the container user to supplementary groups via --group-add.
-    // Accepts group names or numeric GIDs (e.g. for a bind-mounted Docker socket).
-    groups: ["docker", 999],
-    // Optional: expose host devices via --device. Each entry is a full device
-    // spec in host[:container[:permissions]] form (e.g. "/dev/kvm").
-    devices: ["/dev/kvm"],
+    // Optional: attach container to a custom/proxy Docker network — string or
+    // string[]. This is the egress-control lever (see "Egress control" below).
+    // network: "my-egress-proxy-net",
     // Optional: limit CPU resources via --cpus. Fractional values allowed (e.g. 1.5).
     // cpus: 2,
+    //
+    // ⚠️ Host-access escape hatches — each grants the agent host-level access
+    // and is INERT unless `allowDangerousHostAccess: true` is also set (the
+    // provider throws otherwise). Only enable for workloads you fully trust:
+    // allowDangerousHostAccess: true,
+    // network: "host",              // shares the host network namespace
+    // groups: ["docker", 999],      // e.g. to reach a bind-mounted Docker socket (DooD)
+    // devices: ["/dev/kvm"],        // exposes host hardware
+    // mounts: [{ hostPath: "/var/run/docker.sock", sandboxPath: "/var/run/docker.sock" }],
   }),
 
   // Host repo directory — replaces process.cwd() as the anchor for
