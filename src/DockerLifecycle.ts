@@ -3,6 +3,10 @@ import { execFile } from "node:child_process";
 import { resolve } from "node:path";
 import { DockerError } from "./errors.js";
 import { formatVolumeMount, type SelinuxLabel } from "./mountUtils.js";
+import {
+  resolveHardeningFlags,
+  type RunHardeningOptions,
+} from "./runHardening.js";
 
 const dockerExec = (args: string[]): Effect.Effect<string, DockerError> =>
   Effect.async((resume) => {
@@ -86,6 +90,12 @@ export interface StartContainerOptions {
   /** Limit CPU resources via `--cpus` (e.g. `1.5`). Fractional values allowed. */
   readonly cpus?: number;
   /**
+   * Privilege- and resource-hardening flags applied to the run line. Every field
+   * defaults to a hardened value (drop all caps, no-new-privileges, a pids
+   * limit); omit to accept the defaults. See {@link RunHardeningOptions}.
+   */
+  readonly hardening?: RunHardeningOptions;
+  /**
    * SELinux volume label suffix applied to bind mounts (default `"z"`).
    *
    * - `"z"` — shared label. No-op on non-SELinux systems.
@@ -152,6 +162,7 @@ export const startContainer = (
     ]);
     const cpusFlags =
       options?.cpus !== undefined ? ["--cpus", String(options.cpus)] : [];
+    const hardeningFlags = resolveHardeningFlags(options?.hardening);
 
     yield* dockerExec([
       "run",
@@ -166,6 +177,7 @@ export const startContainer = (
       ...groupAddFlags,
       ...deviceFlags,
       ...cpusFlags,
+      ...hardeningFlags,
       imageName,
     ]);
   });

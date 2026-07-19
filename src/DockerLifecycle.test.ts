@@ -464,3 +464,88 @@ describe("startContainer", () => {
     expect(runArgs[vIdx + 1]).toBe("/host/path:/sandbox/path:ro");
   });
 });
+
+const getRunArgs = () => {
+  const runCall = mockExecFile.mock.calls.find(
+    ([, args]) => Array.isArray(args) && args[0] === "run",
+  );
+  expect(runCall).toBeDefined();
+  return runCall![1] as string[];
+};
+
+const valueAfter = (args: string[], flag: string) => {
+  const idx = args.indexOf(flag);
+  return idx === -1 ? undefined : args[idx + 1];
+};
+
+describe("startContainer hardening", () => {
+  const succeed = () => {
+    mockExecFile.mockImplementation((_cmd, _args, _opts, cb: any) => {
+      cb(null, "", "");
+      return undefined as any;
+    });
+  };
+
+  it("drops all capabilities, sets no-new-privileges and a pids-limit by default", async () => {
+    succeed();
+    await Effect.runPromise(startContainer("ctr", "img", {}));
+    const runArgs = getRunArgs();
+    expect(valueAfter(runArgs, "--cap-drop")).toBe("ALL");
+    const soIdx = runArgs.indexOf("--security-opt");
+    expect(soIdx).toBeGreaterThan(-1);
+    expect(runArgs[soIdx + 1]).toBe("no-new-privileges");
+    expect(valueAfter(runArgs, "--pids-limit")).toBe("2048");
+  });
+
+  it("does not set --memory or --cap-add by default", async () => {
+    succeed();
+    await Effect.runPromise(startContainer("ctr", "img", {}));
+    const runArgs = getRunArgs();
+    expect(runArgs).not.toContain("--memory");
+    expect(runArgs).not.toContain("--cap-add");
+  });
+
+  it("replaces the cap-drop set when overridden", async () => {
+    succeed();
+    await Effect.runPromise(
+      startContainer(
+        "ctr",
+        "img",
+        {},
+        { hardening: { capDrop: ["NET_ADMIN"] } },
+      ),
+    );
+    const runArgs = getRunArgs();
+    expect(valueAfter(runArgs, "--cap-drop")).toBe("NET_ADMIN");
+    expect(runArgs).not.toContain("ALL");
+  });
+
+  it("omits --pids-limit when set to false", async () => {
+    succeed();
+    await Effect.runPromise(
+      startContainer("ctr", "img", {}, { hardening: { pidsLimit: false } }),
+    );
+    expect(getRunArgs()).not.toContain("--pids-limit");
+  });
+
+  it("omits no-new-privileges when disabled", async () => {
+    succeed();
+    await Effect.runPromise(
+      startContainer(
+        "ctr",
+        "img",
+        {},
+        { hardening: { noNewPrivileges: false } },
+      ),
+    );
+    expect(getRunArgs()).not.toContain("--security-opt");
+  });
+
+  it("sets --memory when opted in", async () => {
+    succeed();
+    await Effect.runPromise(
+      startContainer("ctr", "img", {}, { hardening: { memory: "8g" } }),
+    );
+    expect(valueAfter(getRunArgs(), "--memory")).toBe("8g");
+  });
+});
