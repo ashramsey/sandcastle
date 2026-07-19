@@ -32,6 +32,10 @@ import {
 } from "../mountUtils.js";
 import { BoundedTail, MAX_TAIL_CHARS } from "../boundedTail.js";
 import { registerShutdown } from "../shutdownRegistry.js";
+import {
+  resolveHardeningFlags,
+  type RunHardeningOptions,
+} from "../runHardening.js";
 
 export interface PodmanOptions {
   /** Podman image name (default: derived from repo directory name). */
@@ -132,6 +136,13 @@ export interface PodmanOptions {
    * When omitted, no `--cpus` flag is added and the container is unconstrained.
    */
   readonly cpus?: number;
+  /**
+   * Privilege- and resource-hardening flags for the container run line. Every
+   * field defaults to a hardened value (`--cap-drop=ALL`, `--security-opt
+   * no-new-privileges`, `--pids-limit 2048`); `--memory` is opt-in with no
+   * default. Omit to accept the hardened defaults. See {@link RunHardeningOptions}.
+   */
+  readonly hardening?: RunHardeningOptions;
 }
 
 /**
@@ -218,6 +229,7 @@ export const podman = (options?: PodmanOptions): SandboxProvider => {
       ]);
       const cpusArgs =
         options?.cpus !== undefined ? ["--cpus", String(options.cpus)] : [];
+      const hardeningArgs = resolveHardeningFlags(options?.hardening);
 
       // Start container via podman run
       await new Promise<void>((resolve, reject) => {
@@ -234,6 +246,7 @@ export const podman = (options?: PodmanOptions): SandboxProvider => {
             ...groupArgs,
             ...deviceArgs,
             ...cpusArgs,
+            ...hardeningArgs,
             "-w",
             worktreePath,
             ...envArgs,

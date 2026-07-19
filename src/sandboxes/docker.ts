@@ -16,6 +16,7 @@ import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { Effect } from "effect";
 import { startContainer, removeContainer } from "../DockerLifecycle.js";
+import type { RunHardeningOptions } from "../runHardening.js";
 import {
   createBindMountSandboxProvider,
   type SandboxProvider,
@@ -121,6 +122,13 @@ export interface DockerOptions {
    * When omitted, no `--cpus` flag is added and the container is unconstrained.
    */
   readonly cpus?: number;
+  /**
+   * Privilege- and resource-hardening flags for the container run line. Every
+   * field defaults to a hardened value (`--cap-drop=ALL`, `--security-opt
+   * no-new-privileges`, `--pids-limit 2048`); `--memory` is opt-in with no
+   * default. Omit to accept the hardened defaults. See {@link RunHardeningOptions}.
+   */
+  readonly hardening?: RunHardeningOptions;
 }
 
 /**
@@ -193,6 +201,7 @@ export const docker = (options?: DockerOptions): SandboxProvider => {
             groups: options?.groups,
             devices: options?.devices,
             cpus: options?.cpus,
+            hardening: options?.hardening,
             selinuxLabel,
           },
         ),

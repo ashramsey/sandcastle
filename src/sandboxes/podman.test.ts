@@ -607,6 +607,85 @@ describe("podman()", () => {
     await handle.close();
   });
 
+  it("applies the hardened run-line defaults (cap-drop, no-new-privileges, pids-limit)", async () => {
+    // Force a Linux platform so the macOS/Windows Podman Machine pre-flight is skipped.
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "linux" });
+    try {
+      mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
+        const callback = rest[rest.length - 1];
+        callback(null, "", "");
+        return undefined as any;
+      });
+
+      const provider = podman();
+      const handle = await provider.create({
+        worktreePath: "/tmp/worktree",
+        hostRepoPath: "/tmp/repo",
+        mounts: [
+          { hostPath: "/tmp/worktree", sandboxPath: "/home/agent/workspace" },
+        ],
+        env: {},
+      });
+
+      const runArgs = mockExecFile.mock.calls.find(
+        ([, args]) => Array.isArray(args) && args[0] === "run",
+      )?.[1] as string[];
+
+      const capIdx = runArgs.indexOf("--cap-drop");
+      expect(capIdx).toBeGreaterThan(-1);
+      expect(runArgs[capIdx + 1]).toBe("ALL");
+      const soIdx = runArgs.indexOf("--security-opt");
+      expect(soIdx).toBeGreaterThan(-1);
+      expect(runArgs[soIdx + 1]).toBe("no-new-privileges");
+      const pidsIdx = runArgs.indexOf("--pids-limit");
+      expect(pidsIdx).toBeGreaterThan(-1);
+      expect(runArgs[pidsIdx + 1]).toBe("2048");
+      expect(runArgs).not.toContain("--memory");
+
+      await handle.close();
+    } finally {
+      Object.defineProperty(process, "platform", { value: originalPlatform });
+    }
+  });
+
+  it("honors hardening overrides (memory opt-in, pids-limit disabled)", async () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "linux" });
+    try {
+      mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
+        const callback = rest[rest.length - 1];
+        callback(null, "", "");
+        return undefined as any;
+      });
+
+      const provider = podman({
+        hardening: { memory: "4g", pidsLimit: false },
+      });
+      const handle = await provider.create({
+        worktreePath: "/tmp/worktree",
+        hostRepoPath: "/tmp/repo",
+        mounts: [
+          { hostPath: "/tmp/worktree", sandboxPath: "/home/agent/workspace" },
+        ],
+        env: {},
+      });
+
+      const runArgs = mockExecFile.mock.calls.find(
+        ([, args]) => Array.isArray(args) && args[0] === "run",
+      )?.[1] as string[];
+
+      const memIdx = runArgs.indexOf("--memory");
+      expect(memIdx).toBeGreaterThan(-1);
+      expect(runArgs[memIdx + 1]).toBe("4g");
+      expect(runArgs).not.toContain("--pids-limit");
+
+      await handle.close();
+    } finally {
+      Object.defineProperty(process, "platform", { value: originalPlatform });
+    }
+  });
+
   it("does not pass --cpus flag when cpus is omitted", async () => {
     mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
       const callback = rest[rest.length - 1];
