@@ -33,6 +33,7 @@ import {
 } from "./AgentStreamEmitter.js";
 import type { SandboxHooks } from "./SandboxLifecycle.js";
 import { mergeProviderEnv } from "./mergeProviderEnv.js";
+import { createEnvSecretRedactor, type Redactor } from "./redactSecrets.js";
 import { generateTempBranchName, getCurrentBranch } from "./WorktreeManager.js";
 import {
   type PromptArgs,
@@ -270,11 +271,12 @@ export type LoggingOption =
  */
 export const buildAgentStreamHandler = (
   logging: LoggingOption,
+  redact: Redactor = (t) => t,
 ): ((event: AgentStreamEvent) => void) | undefined => {
   const userHandler =
     logging.type === "file" ? logging.onAgentStreamEvent : undefined;
   const verboseSink = logging.verbose
-    ? buildVerboseRawLineSink(logging)
+    ? buildVerboseRawLineSink(logging, redact)
     : undefined;
   if (!userHandler && !verboseSink) return undefined;
   return (event) => {
@@ -293,6 +295,7 @@ export const buildAgentStreamHandler = (
 
 const buildVerboseRawLineSink = (
   logging: LoggingOption,
+  redact: Redactor = (t) => t,
 ): ((line: string) => void) => {
   if (logging.type === "file") {
     const logPath = logging.path;
@@ -306,14 +309,14 @@ const buildVerboseRawLineSink = (
     }
     return (line) => {
       try {
-        appendFileSync(logPath, line + "\n");
+        appendFileSync(logPath, redact(line) + "\n");
       } catch {
         // Swallow — verbose-mode I/O errors must not kill the run.
       }
     };
   }
   return (line) => {
-    process.stdout.write(line + "\n");
+    process.stdout.write(redact(line) + "\n");
   };
 };
 
@@ -625,6 +628,10 @@ export async function run(
     sandboxProviderEnv: options.sandbox.env,
   });
 
+  // Mask injected credentials and user-declared secrets before they are
+  // persisted to the run log or captured session transcripts (h07).
+  const redact = createEnvSecretRedactor(env);
+
   // Always capture the host's current branch for the TARGET_BRANCH built-in
   // prompt argument. When using a temp branch, it also prefixes the log filename.
   const currentHostBranch = await Effect.runPromise(
@@ -689,7 +696,7 @@ export async function run(
   );
 
   const streamEmitterLayer = agentStreamEmitterLayer(
-    buildAgentStreamHandler(resolvedLogging),
+    buildAgentStreamHandler(resolvedLogging, redact),
   );
 
   const runLayer = Layer.mergeAll(
@@ -745,6 +752,7 @@ export async function run(
       prompt: resolvedPrompt,
       branch: orchestrateBranch,
       provider,
+      redact,
       completionSignal: options.completionSignal,
       idleTimeoutSeconds: options.idleTimeoutSeconds,
       completionTimeoutSeconds: options.completionTimeoutSeconds,

@@ -12,6 +12,7 @@ import {
 } from "./AgentProvider.js";
 import type { AgentCommandOptions } from "./AgentProvider.js";
 import type { BindMountSandboxHandle } from "./SandboxProvider.js";
+import { createSecretRedactor } from "./redactSecrets.js";
 
 /** Shorthand: build options with dangerouslySkipPermissions: true (mirrors existing sandbox callers). */
 const opts = (prompt: string): AgentCommandOptions => ({
@@ -2217,6 +2218,68 @@ describe("sessionStorage", () => {
       expect(await provider.sessionStorage!.existsOnHost(hostCwd, id)).toBe(
         true,
       );
+    } finally {
+      await rm(hostDir, { recursive: true, force: true });
+      await rm(sandboxDir, { recursive: true, force: true });
+    }
+  });
+
+  it("captureToHost masks a secret in the transcript before writing, keeping the JSONL parseable (h07)", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "sandcastle-pi-redact-host-"));
+    const sandboxDir = await mkdtemp(
+      join(tmpdir(), "sandcastle-pi-redact-sbx-"),
+    );
+    try {
+      const id = "9ba1c695-2222-4444-8888-e7e847bf34dd";
+      const sandboxCwd = "/sandbox/repo";
+      const hostCwd = "/host/repo";
+      const secret = "sk-ant-supersecrettoken-0123456789";
+      const filename = `2026-05-29T08-00-00_${id}.jsonl`;
+      const sandboxSessionDir = join(sandboxDir, "--sandbox-repo--");
+      await mkdir(sandboxSessionDir, { recursive: true });
+      const sandboxPath = join(sandboxSessionDir, filename);
+      const jsonl = [
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id,
+          timestamp: "2026-05-29T08:00:00Z",
+          cwd: sandboxCwd,
+        }),
+        JSON.stringify({
+          type: "message",
+          role: "assistant",
+          content: [{ type: "text", text: `the key is ${secret} ok` }],
+        }),
+      ].join("\n");
+      await writeFile(sandboxPath, jsonl);
+
+      const provider = pi("claude-sonnet-4-6", {
+        sessionStorage: {
+          hostSessionsDir: hostDir,
+          sandboxSessionsDir: sandboxDir,
+        },
+      });
+
+      await provider.sessionStorage!.captureToHost({
+        hostCwd,
+        sandboxCwd,
+        sessionId: id,
+        handle: fsBindMountHandle(),
+        redact: createSecretRedactor([secret]),
+      });
+
+      const expectedHostPath = join(hostDir, "--host-repo--", filename);
+      const content = await readFile(expectedHostPath, "utf-8");
+      // The secret is gone; the placeholder is present.
+      expect(content).not.toContain(secret);
+      expect(content).toContain("[redacted]");
+      // The redacted transcript is still valid JSONL — each line parses.
+      const lines = content.split("\n");
+      const message = JSON.parse(lines[1]!);
+      expect(message.content[0].text).toBe("the key is [redacted] ok");
+      // cwd rewrite still happened on the header line.
+      expect(JSON.parse(lines[0]!).cwd).toBe(hostCwd);
     } finally {
       await rm(hostDir, { recursive: true, force: true });
       await rm(sandboxDir, { recursive: true, force: true });

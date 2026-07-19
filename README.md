@@ -93,6 +93,8 @@ Worktree methods (`wt.run()`, `wt.interactive()`, `wt.createSandbox()`) accept t
 docker({ hardening: { capAdd: ["NET_BIND_SERVICE"], memory: "8g" } });
 ```
 
+**Secret redaction.** Injected credentials (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`) and user-declared secrets — env keys whose names look sensitive (`*_TOKEN`, `*_SECRET`, `*PASSWORD*`, `*API_KEY*`, and similar) — are masked with `[redacted]` before they are written to the verbose run log or to the captured session `.jsonl` transcripts on the host. This narrows the blast radius of a single leaked line persisted to disk. It is defense-in-depth, not a substitute for scoping tokens down to short-lived, least-privilege credentials.
+
 ```typescript
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { podman } from "@ai-hero/sandcastle/sandboxes/podman";

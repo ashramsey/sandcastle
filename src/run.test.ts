@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import {
+  buildAgentStreamHandler,
   buildCompletionMessage,
   buildContextWindowLines,
   buildLogFilename,
@@ -22,6 +23,7 @@ import {
   type RunOptions,
   type RunResult,
 } from "./run.js";
+import { createSecretRedactor } from "./redactSecrets.js";
 import { claudeCode, cursor, opencode } from "./AgentProvider.js";
 import { Output, StructuredOutputError } from "./Output.js";
 import { claudeHostSessionPath } from "./SessionStore.js";
@@ -1501,5 +1503,56 @@ describe("output.maxRetries end-to-end", () => {
         output: Output.object({ tag: "result", schema: mockSchema() }),
       }),
     ).rejects.toBeInstanceOf(StructuredOutputError);
+  });
+});
+
+describe("buildAgentStreamHandler verbose-sink redaction (h07)", () => {
+  it("masks a known secret in a raw line before it hits the log file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "sandcastle-redact-log-"));
+    try {
+      const logPath = join(dir, "run.log");
+      const secret = "sk-ant-supersecrettoken-0123456789";
+      const handler = buildAgentStreamHandler(
+        { type: "file", path: logPath, verbose: true },
+        createSecretRedactor([secret]),
+      );
+      handler!({
+        type: "raw",
+        line: `tool output: authorization Bearer ${secret} done`,
+        iteration: 1,
+        timestamp: new Date(),
+      });
+
+      const contents = readFileSync(logPath, "utf-8");
+      expect(contents).not.toContain(secret);
+      expect(contents).toContain("[redacted]");
+      expect(contents).toBe(
+        "tool output: authorization Bearer [redacted] done\n",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes raw lines unchanged when no redactor is supplied", () => {
+    const dir = mkdtempSync(join(tmpdir(), "sandcastle-redact-log-noop-"));
+    try {
+      const logPath = join(dir, "run.log");
+      const handler = buildAgentStreamHandler({
+        type: "file",
+        path: logPath,
+        verbose: true,
+      });
+      handler!({
+        type: "raw",
+        line: "nothing secret here",
+        iteration: 1,
+        timestamp: new Date(),
+      });
+
+      expect(readFileSync(logPath, "utf-8")).toBe("nothing secret here\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

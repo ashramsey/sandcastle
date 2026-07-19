@@ -12,6 +12,7 @@ import type { SandboxService } from "./SandboxFactory.js";
 import { SandboxFactory, SANDBOX_REPO_DIR } from "./SandboxFactory.js";
 import { withSandboxLifecycle, type SandboxHooks } from "./SandboxLifecycle.js";
 import type { AgentProvider, IterationUsage } from "./AgentProvider.js";
+import type { Redactor } from "./redactSecrets.js";
 import type { Timeouts } from "./run.js";
 import { TextDeltaBuffer } from "./TextDeltaBuffer.js";
 
@@ -254,6 +255,13 @@ export interface OrchestrateOptions {
   readonly prompt: string;
   readonly branch?: string;
   readonly provider: AgentProvider;
+  /**
+   * Masks known secret values in captured session transcripts before they are
+   * written to the host store (h07). Built once from the merged launch env by
+   * the entry point and threaded through; the Orchestrator has no env of its
+   * own to rebuild it from. Omitted → no redaction.
+   */
+  readonly redact?: Redactor;
   readonly completionSignal?: string | string[];
   /** Idle timeout in seconds. If the agent produces no output for this long, it fails with AgentIdleTimeoutError. Default: 600 (10 minutes) */
   readonly idleTimeoutSeconds?: number;
@@ -518,6 +526,7 @@ export const orchestrate = (
                         sandboxCwd: ctx.sandboxRepoDir,
                         sessionId,
                         handle: bindMountHandle,
+                        redact: options.redact,
                       }),
                     catch: (e) =>
                       new SessionCaptureError({

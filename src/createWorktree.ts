@@ -41,6 +41,7 @@ import { orchestrate, type IterationResult } from "./Orchestrator.js";
 import { agentStreamEmitterLayer } from "./AgentStreamEmitter.js";
 import { resolveEnv } from "./EnvResolver.js";
 import { mergeProviderEnv } from "./mergeProviderEnv.js";
+import { createEnvSecretRedactor } from "./redactSecrets.js";
 import { startSandbox } from "./startSandbox.js";
 import { syncOut } from "./syncOut.js";
 import * as WorktreeManager from "./WorktreeManager.js";
@@ -538,6 +539,10 @@ export const createWorktree = async (
       });
       const effectiveEnv = { ...env, ...(opts.env ?? {}) };
 
+      // Mask injected credentials and user-declared secrets (incl. per-run
+      // `opts.env` overrides) before they reach the run log or transcripts (h07).
+      const redact = createEnvSecretRedactor(effectiveEnv);
+
       // 3. Prompt args substitution (skipped for inline prompts — passthrough)
       const userArgs = opts.promptArgs ?? {};
       let resolvedPrompt: string;
@@ -663,7 +668,7 @@ export const createWorktree = async (
       });
 
       const streamEmitterLayer = agentStreamEmitterLayer(
-        buildAgentStreamHandler(resolvedLogging),
+        buildAgentStreamHandler(resolvedLogging, redact),
       );
 
       const runLayer = Layer.mergeAll(
@@ -687,6 +692,7 @@ export const createWorktree = async (
           // pin to the worktree's branch so commits stay there.
           branch: isMergeToHead ? undefined : worktreeInfo.branch,
           provider,
+          redact,
           completionSignal: opts.completionSignal,
           idleTimeoutSeconds: opts.idleTimeoutSeconds,
           completionTimeoutSeconds: opts.completionTimeoutSeconds,
