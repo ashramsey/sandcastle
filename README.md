@@ -76,6 +76,8 @@ Sandcastle uses a `SandboxProvider` to create isolated environments. The `sandbo
 
 Worktree methods (`wt.run()`, `wt.interactive()`, `wt.createSandbox()`) accept the same providers as their top-level counterparts. `wt.interactive()` defaults to `noSandbox()` when no sandbox is specified.
 
+**Bind-mount hardening.** The bind-mount providers (Docker, Podman) mount the host repo's `.git/hooks` and `.git/config` **read-only** so a prompt-injected agent cannot plant a git hook or a code-executing config entry (`core.hooksPath`, an executable `alias`, an external diff/filter driver, etc.) that would later run as the developer on the host. Commits are unaffected — they write objects and refs, not hooks or config. This blocks in-sandbox repo-local config writes (`git remote add`, `git config --local`, tracking-branch creation); trusted workflows that need those can opt out by setting `SANDCASTLE_ALLOW_GIT_CONFIG_WRITES=1`.
+
 ```typescript
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { podman } from "@ai-hero/sandcastle/sandboxes/podman";

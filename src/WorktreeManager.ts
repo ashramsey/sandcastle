@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { join, normalize } from "node:path";
 import { WorktreeError, WorktreeTimeoutError, withTimeout } from "./errors.js";
+import { HOOK_NEUTRALIZE_FLAGS } from "./hostGit.js";
 
 const WORKTREE_TIMEOUT_MS = 30_000;
 
@@ -52,7 +53,9 @@ const execGit = (
     // matches silently fail, breaking worktree creation (issue #595).
     execFile(
       "git",
-      args,
+      // Neutralize agent-planted repo hooks / fsmonitor on every host-side git
+      // call (see hostGit.ts / ticket harden/git-hook-host-execution, F1).
+      [...HOOK_NEUTRALIZE_FLAGS, ...args],
       { cwd, env: { ...process.env, LC_ALL: "C" } },
       (error, stdout, stderr) => {
         if (error) {
