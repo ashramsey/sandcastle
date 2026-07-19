@@ -32,7 +32,10 @@ import {
 } from "../mountUtils.js";
 import { BoundedTail, MAX_TAIL_CHARS } from "../boundedTail.js";
 import { registerShutdown } from "../shutdownRegistry.js";
-import { resolveHardeningFlags } from "../runHardening.js";
+import {
+  resolveHardeningFlags,
+  type RunHardeningOptions,
+} from "../runHardening.js";
 
 export interface PodmanOptions {
   /** Podman image name (default: derived from repo directory name). */
@@ -134,33 +137,12 @@ export interface PodmanOptions {
    */
   readonly cpus?: number;
   /**
-   * Linux capabilities to drop, via `--cap-drop`. Defaults to `["ALL"]` (the
-   * stock image needs none). Pass a set to replace the default, or `[]` to drop
-   * nothing. Add specific caps back with {@link capAdd}.
+   * Privilege- and resource-hardening flags for the container run line. Every
+   * field defaults to a hardened value (`--cap-drop=ALL`, `--security-opt
+   * no-new-privileges`, `--pids-limit 2048`); `--memory` is opt-in with no
+   * default. Omit to accept the hardened defaults. See {@link RunHardeningOptions}.
    */
-  readonly capDrop?: readonly string[];
-  /**
-   * Linux capabilities to add back after the drop, via `--cap-add`. Defaults to
-   * none. Use to grant a workload a specific capability while keeping
-   * `--cap-drop=ALL` (e.g. `["NET_BIND_SERVICE"]`).
-   */
-  readonly capAdd?: readonly string[];
-  /**
-   * Set `--security-opt no-new-privileges` to block setuid privilege escalation
-   * inside the container. Defaults to `true`; pass `false` to omit.
-   */
-  readonly noNewPrivileges?: boolean;
-  /**
-   * Bound the number of PIDs via `--pids-limit` (fork-bomb protection).
-   * Defaults to `2048`. Pass a number to override, or `false` to remove it.
-   */
-  readonly pidsLimit?: number | false;
-  /**
-   * Cap container memory via `--memory` (e.g. `"8g"`). No default — omitted
-   * unless set — so a legitimate heavy build is never OOM-killed by a fixed
-   * ceiling. Opt in when you want one.
-   */
-  readonly memory?: string;
+  readonly hardening?: RunHardeningOptions;
 }
 
 /**
@@ -247,13 +229,7 @@ export const podman = (options?: PodmanOptions): SandboxProvider => {
       ]);
       const cpusArgs =
         options?.cpus !== undefined ? ["--cpus", String(options.cpus)] : [];
-      const hardeningArgs = resolveHardeningFlags({
-        capDrop: options?.capDrop,
-        capAdd: options?.capAdd,
-        noNewPrivileges: options?.noNewPrivileges,
-        pidsLimit: options?.pidsLimit,
-        memory: options?.memory,
-      });
+      const hardeningArgs = resolveHardeningFlags(options?.hardening);
 
       // Start container via podman run
       await new Promise<void>((resolve, reject) => {

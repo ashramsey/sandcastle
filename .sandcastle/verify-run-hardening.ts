@@ -190,11 +190,9 @@ try {
   const sandboxB = await createSandbox({
     sandbox: docker({
       imageName: IMAGE,
-      memory: "6g",
-      pidsLimit: 512,
-      capAdd: ["CHOWN"],
+      hardening: { memory: "6g", pidsLimit: 512, capAdd: ["CHOWN"] },
     }),
-    // PODMAN: sandbox: podman({ imageName: IMAGE, memory: "6g", pidsLimit: 512, capAdd: ["CHOWN"] }),
+    // PODMAN: sandbox: podman({ imageName: IMAGE, hardening: { memory: "6g", pidsLimit: 512, capAdd: ["CHOWN"] } }),
     cwd: repo,
     branch: "verify-harden-b",
   });

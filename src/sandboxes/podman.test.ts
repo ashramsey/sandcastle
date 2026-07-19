@@ -659,7 +659,9 @@ describe("podman()", () => {
         return undefined as any;
       });
 
-      const provider = podman({ memory: "4g", pidsLimit: false });
+      const provider = podman({
+        hardening: { memory: "4g", pidsLimit: false },
+      });
       const handle = await provider.create({
         worktreePath: "/tmp/worktree",
         hostRepoPath: "/tmp/repo",

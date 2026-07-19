@@ -78,9 +78,9 @@ Worktree methods (`wt.run()`, `wt.interactive()`, `wt.createSandbox()`) accept t
 
 **Bind-mount hardening.** The bind-mount providers (Docker, Podman) mount the host repo's `.git/hooks` and `.git/config` **read-only** so a prompt-injected agent cannot plant a git hook or a code-executing config entry (`core.hooksPath`, an executable `alias`, an external diff/filter driver, etc.) that would later run as the developer on the host. Commits are unaffected — they write objects and refs, not hooks or config. This blocks in-sandbox repo-local config writes (`git remote add`, `git config --local`, tracking-branch creation); trusted workflows that need those can opt out by setting `SANDCASTLE_ALLOW_GIT_CONFIG_WRITES=1`.
 
-**Run-line hardening.** By default the bind-mount providers also drop privilege and bound resources on the container: `--cap-drop=ALL` (the stock image needs no Linux capabilities), `--security-opt no-new-privileges` (blocks setuid escalation), and `--pids-limit 2048` (fork-bomb protection, generous enough not to throttle parallel builds). Each is overridable through provider config, and there is no default `--memory` ceiling so a legitimate heavy build is never OOM-killed:
+**Run-line hardening.** By default the bind-mount providers also drop privilege and bound resources on the container: `--cap-drop=ALL` (the stock image needs no Linux capabilities), `--security-opt no-new-privileges` (blocks setuid escalation), and `--pids-limit 2048` (fork-bomb protection, generous enough not to throttle parallel builds). These are grouped under a `hardening` option, each field overridable, and there is no default `--memory` ceiling so a legitimate heavy build is never OOM-killed:
 
-| Option            | Default   | Notes                                                         |
+| `hardening` field | Default   | Notes                                                         |
 | ----------------- | --------- | ------------------------------------------------------------- |
 | `capDrop`         | `["ALL"]` | Capabilities to drop. `[]` drops none.                        |
 | `capAdd`          | `[]`      | Add specific capabilities back (e.g. `["NET_BIND_SERVICE"]`). |
@@ -90,7 +90,7 @@ Worktree methods (`wt.run()`, `wt.interactive()`, `wt.createSandbox()`) accept t
 
 ```typescript
 // Trusted workflow that needs a raised port and a memory ceiling:
-docker({ capAdd: ["NET_BIND_SERVICE"], memory: "8g" });
+docker({ hardening: { capAdd: ["NET_BIND_SERVICE"], memory: "8g" } });
 ```
 
 ```typescript
