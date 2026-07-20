@@ -2459,6 +2459,69 @@ describe("sessionStorage", () => {
     }
   });
 
+  it("claudeCode captureToHost reads the session via exec (not copyFileOut) so it works on a read-only-rootfs tmpfs mount (h10)", async () => {
+    const hostDir = await mkdtemp(
+      join(tmpdir(), "sandcastle-claude-tmpfs-read-"),
+    );
+    const sandboxDir = await mkdtemp(
+      join(tmpdir(), "sandcastle-claude-tmpfs-read-sbx-"),
+    );
+    try {
+      const id = "session-tmpfs";
+      const hostCwd = "/host/repo";
+      const sandboxCwd = "/sandbox/repo";
+      const sandboxProjectDir = join(sandboxDir, "-sandbox-repo");
+      await mkdir(sandboxProjectDir, { recursive: true });
+      // A multibyte payload proves the base64 round-trip is byte-exact and not
+      // mangled by the per-chunk UTF-8 decoding in the exec plumbing.
+      const marker = "café-\u{1F510}-Ω";
+      await writeFile(
+        join(sandboxProjectDir, `${id}.jsonl`),
+        JSON.stringify({ type: "system", cwd: sandboxCwd, marker }),
+      );
+
+      // Under a read-only rootfs the session lives on a tmpfs that `docker cp`
+      // (copyFileOut) cannot read; fail copyFileOut outright to prove capture
+      // never touches it and reads via exec instead.
+      const base = fsBindMountHandle();
+      const execCommands: string[] = [];
+      const handle: BindMountSandboxHandle = {
+        ...base,
+        exec: async (command, options) => {
+          execCommands.push(command);
+          return base.exec(command, options);
+        },
+        copyFileOut: async () => {
+          throw new Error("copyFileOut must not be used — tmpfs is unreadable");
+        },
+      };
+
+      const provider = claudeCode("claude-opus-4-8", {
+        sessionStorage: {
+          hostProjectsDir: hostDir,
+          sandboxProjectsDir: sandboxDir,
+        },
+      });
+
+      await provider.sessionStorage!.captureToHost({
+        hostCwd,
+        sandboxCwd,
+        sessionId: id,
+        handle,
+      });
+
+      const captured = await readFile(
+        join(hostDir, "-host-repo", `${id}.jsonl`),
+        "utf-8",
+      );
+      expect(JSON.parse(captured).marker).toBe(marker);
+      expect(execCommands.some((c) => c.startsWith("base64 <"))).toBe(true);
+    } finally {
+      await rm(hostDir, { recursive: true, force: true });
+      await rm(sandboxDir, { recursive: true, force: true });
+    }
+  });
+
   it("claudeCode captureToHost copies subagent/workflow logs alongside the main session with cwd rewritten", async () => {
     const hostDir = await mkdtemp(
       join(tmpdir(), "sandcastle-claude-sub-many-"),
@@ -2571,7 +2634,7 @@ describe("sessionStorage", () => {
         join(sandboxSubagentsDir, "agent-good.jsonl"),
         JSON.stringify({ type: "system", cwd: sandboxCwd, agent: "good" }),
       );
-      // Bad subagent: enumerated by find but fails on read (copyFileOut).
+      // Bad subagent: enumerated by find but fails on read (base64 exec).
       await writeFile(
         join(sandboxSubagentsDir, "agent-bad.jsonl"),
         JSON.stringify({ type: "system", cwd: sandboxCwd, agent: "bad" }),
@@ -2590,15 +2653,21 @@ describe("sessionStorage", () => {
       };
 
       try {
-        // Decorate the fs handle: make copyFileOut fail for the bad subagent.
+        // Decorate the fs handle: the session read now runs `base64 <path>`
+        // over exec, so fail that exec for the bad subagent (non-zero exit is
+        // what readSandboxFile throws on).
         const base = fsBindMountHandle();
         const handle: BindMountSandboxHandle = {
           ...base,
-          copyFileOut: async (sandboxPath, destPath) => {
-            if (sandboxPath.endsWith("agent-bad.jsonl")) {
-              throw new Error("simulated copyFileOut failure");
+          exec: async (command, options) => {
+            if (command.includes("agent-bad.jsonl")) {
+              return {
+                stdout: "",
+                stderr: "simulated base64 read failure",
+                exitCode: 1,
+              };
             }
-            return base.copyFileOut(sandboxPath, destPath);
+            return base.exec(command, options);
           },
         };
 

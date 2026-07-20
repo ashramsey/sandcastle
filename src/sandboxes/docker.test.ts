@@ -191,6 +191,89 @@ describe("docker()", () => {
     });
   });
 
+  describe("read-only rootfs (h10)", () => {
+    const runDocker = async (
+      options?: Parameters<typeof docker>[0],
+      createEnv: Record<string, string> = {},
+    ) => {
+      mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
+        const callback = rest[rest.length - 1];
+        callback(null, "", "");
+        return undefined as any;
+      });
+      const provider = docker(options);
+      const handle = await provider.create({
+        worktreePath: "/tmp/worktree",
+        hostRepoPath: "/tmp/repo",
+        mounts: [
+          { hostPath: "/tmp/worktree", sandboxPath: "/home/agent/workspace" },
+        ],
+        env: createEnv,
+      });
+      const runArgs = mockExecFile.mock.calls.find(
+        ([, args]) => Array.isArray(args) && args[0] === "run",
+      )?.[1] as string[];
+      await handle.close();
+      return runArgs;
+    };
+
+    /** The value of the `-e KEY=...` flag (undefined if the key is absent). */
+    const envValue = (args: string[], key: string): string | undefined => {
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] === "-e" && args[i + 1]?.startsWith(`${key}=`)) {
+          return args[i + 1]!.slice(key.length + 1);
+        }
+      }
+      return undefined;
+    };
+
+    it("emits --read-only and tmpfs mounts by default", async () => {
+      const runArgs = await runDocker();
+      expect(runArgs).toContain("--read-only");
+      const tmpfs: string[] = [];
+      for (let i = 0; i < runArgs.length; i++) {
+        if (runArgs[i] === "--tmpfs") tmpfs.push(runArgs[i + 1]!);
+      }
+      // mode=1777 makes the mounts writable by the non-root agent user.
+      expect(tmpfs).toContain("/tmp:mode=1777");
+      expect(tmpfs).toContain("/home/agent/.claude:mode=1777");
+      expect(tmpfs).not.toContain("/home/agent");
+    });
+
+    it("defaults CLAUDE_CONFIG_DIR and GIT_CONFIG_GLOBAL to tmpfs paths under read-only", async () => {
+      const runArgs = await runDocker();
+      expect(envValue(runArgs, "CLAUDE_CONFIG_DIR")).toBe(
+        "/home/agent/.claude",
+      );
+      // ~/.gitconfig is a read-only home-root file; relocate it onto ~/.config tmpfs.
+      expect(envValue(runArgs, "GIT_CONFIG_GLOBAL")).toBe(
+        "/home/agent/.config/gitconfig",
+      );
+    });
+
+    it("lets the caller's CLAUDE_CONFIG_DIR / GIT_CONFIG_GLOBAL win over the default", async () => {
+      const runArgs = await runDocker(
+        {},
+        {
+          CLAUDE_CONFIG_DIR: "/custom/cfg",
+          GIT_CONFIG_GLOBAL: "/custom/gitconfig",
+        },
+      );
+      expect(envValue(runArgs, "CLAUDE_CONFIG_DIR")).toBe("/custom/cfg");
+      expect(envValue(runArgs, "GIT_CONFIG_GLOBAL")).toBe("/custom/gitconfig");
+    });
+
+    it("omits --read-only, tmpfs, and the config-relocation defaults when disabled", async () => {
+      const runArgs = await runDocker({
+        hardening: { readOnlyRootfs: false },
+      });
+      expect(runArgs).not.toContain("--read-only");
+      expect(runArgs).not.toContain("--tmpfs");
+      expect(envValue(runArgs, "CLAUDE_CONFIG_DIR")).toBeUndefined();
+      expect(envValue(runArgs, "GIT_CONFIG_GLOBAL")).toBeUndefined();
+    });
+  });
+
   describe("host-access gate (h06)", () => {
     it("throws at construction for a host-access hatch without the ack flag", () => {
       expect(() => docker({ network: "host" })).toThrow(

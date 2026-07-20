@@ -10,12 +10,16 @@
  *   - ticket 01/08 — `.git/hooks` + `.git/config` mounted read-only
  *   - ticket 02    — `--cap-drop=ALL`, `--security-opt no-new-privileges`,
  *                    `--pids-limit 2048`
+ *   - ticket 10    — `--read-only` rootfs + `--tmpfs` writable set, with the
+ *                    provider defaulting `CLAUDE_CONFIG_DIR` to the ~/.claude
+ *                    tmpfs so the agent's config/session state stays writable
  *
  * The no-agent runners (`verify-git-config-mount.ts`, `verify-run-hardening.ts`)
  * prove the mounts/flags are applied and that scripted writes behave. This
  * runner closes the one criterion they cannot: that a *real agent* — editing
- * files, committing in the worktree, and writing its own session state — still
- * succeeds under the hardened posture. It needs an API key.
+ * files, committing in the worktree, and writing its own session state
+ * (`~/.claude` + `~/.claude.json`, relocated onto the tmpfs) — still succeeds
+ * under the hardened posture, including the read-only rootfs. It needs an API key.
  *
  * ----------------------------------------------------------------------------
  * PREREQUISITES (from the repo root, ON A DOCKER HOST)
@@ -119,6 +123,52 @@ try {
     "committed GREETING.txt has the expected contents",
     show === "hello from the sandbox",
     JSON.stringify(show),
+  );
+
+  // ticket 10: confirm the run actually happened under a read-only rootfs, and
+  // that the agent's config/session state was written to the ~/.claude tmpfs
+  // (via the provider's default CLAUDE_CONFIG_DIR) rather than the read-only
+  // ~/.claude.json at the home root.
+  const cid = execFileSync("docker", [
+    // PODMAN: swap "docker" -> "podman"
+    "ps",
+    "-q",
+    "--filter",
+    `ancestor=${IMAGE}`,
+    "--filter",
+    "status=running",
+  ])
+    .toString()
+    .trim()
+    .split("\n")
+    .filter(Boolean);
+  if (cid.length === 1) {
+    const readonly = execFileSync("docker", [
+      "inspect",
+      "--format",
+      "{{.HostConfig.ReadonlyRootfs}}",
+      cid[0]!,
+    ])
+      .toString()
+      .trim();
+    check("agent ran under a read-only rootfs", readonly === "true", readonly);
+  } else {
+    check(
+      "exactly one running sandbox container to inspect",
+      false,
+      `found ${cid.length}`,
+    );
+  }
+
+  const cfg = await sandbox.exec(
+    'echo "dir=$CLAUDE_CONFIG_DIR"; ls -A "$CLAUDE_CONFIG_DIR" 2>&1 | head',
+  );
+  check(
+    "agent wrote session/config state onto the ~/.claude tmpfs",
+    cfg.exitCode === 0 &&
+      cfg.stdout.includes("dir=/home/agent/.claude") &&
+      cfg.stdout.trim().split("\n").length > 1,
+    cfg.stdout.trim().replace(/\n/g, " | "),
   );
 } finally {
   await sandbox.close();

@@ -3177,10 +3177,17 @@ describe("Session capture integration", () => {
             return branchName;
           }),
           (_branchName) => {
-            // Create a bind-mount handle backed by filesystem copy
+            // Build a sandbox service that intercepts claude commands
+            const real = makeLocalSandbox(sandboxBaseDir);
+
+            // Create a bind-mount handle backed by filesystem copy. `exec`
+            // delegates to the real local sandbox so session capture — which now
+            // reads the transcript via `base64 <path>` over exec (docker cp
+            // can't read the read-only-rootfs tmpfs) — actually runs the command.
             const handle: BindMountSandboxHandle = {
               worktreePath: sandboxBaseDir,
-              exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+              exec: (command, options) =>
+                Effect.runPromise(real.exec(command, options)),
               copyFileIn: async (hostPath, sandboxPath) => {
                 await mkdir(join(sandboxPath, ".."), { recursive: true });
                 await copyFile(hostPath, sandboxPath);
@@ -3192,8 +3199,6 @@ describe("Session capture integration", () => {
               close: async () => {},
             };
 
-            // Build a sandbox service that intercepts claude commands
-            const real = makeLocalSandbox(sandboxBaseDir);
             const sandbox: SandboxService = {
               exec: (command, options) => {
                 if (command.startsWith("claude ") && options?.onLine) {
@@ -3506,9 +3511,13 @@ describe("Session capture integration", () => {
             );
           }),
           () => {
+            const real = makeLocalSandbox(sandboxBaseDir);
+            // `exec` delegates to the real local sandbox so session capture (now
+            // a `base64 <path>` exec read) actually runs the command.
             const handle: BindMountSandboxHandle = {
               worktreePath: sandboxBaseDir,
-              exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+              exec: (command, options) =>
+                Effect.runPromise(real.exec(command, options)),
               copyFileIn: async (hostPath, sandboxPath) => {
                 await mkdir(join(sandboxPath, ".."), { recursive: true });
                 await copyFile(hostPath, sandboxPath);
@@ -3520,7 +3529,6 @@ describe("Session capture integration", () => {
               close: async () => {},
             };
 
-            const real = makeLocalSandbox(sandboxBaseDir);
             const sandbox: SandboxService = {
               exec: (command, options) => {
                 if (command.startsWith("claude ") && options?.onLine) {

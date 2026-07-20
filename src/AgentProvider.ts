@@ -293,20 +293,27 @@ export const DEFAULT_MODEL = "claude-opus-4-8";
 // ---------------------------------------------------------------------------
 
 const readSandboxFile = async (
-  handle: Pick<BindMountSandboxHandle, "copyFileOut">,
+  handle: Pick<BindMountSandboxHandle, "exec">,
   sandboxPath: string,
   tag: string,
 ): Promise<string> => {
-  const tmpPath = join(
-    tmpdir(),
-    `sandcastle-${tag}-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`,
-  );
-  await handle.copyFileOut(sandboxPath, tmpPath);
-  try {
-    return await readFile(tmpPath, "utf-8");
-  } finally {
-    await rm(tmpPath, { force: true }).catch(() => {});
+  // Read the file with `base64` over `exec` (i.e. inside the container's mount
+  // namespace) rather than `docker cp`. Under the hardened read-only rootfs the
+  // agent's session state lands on a `--tmpfs` mount, and `docker cp` cannot
+  // read tmpfs mounts — it archives the layered rootfs plus bind/volume mounts
+  // only, so it reports the file as missing. base64 also keeps the transfer
+  // byte-exact: its ASCII output can't be mangled by the per-chunk UTF-8
+  // decoding in the exec plumbing, which a raw `cat` of multibyte JSONL could.
+  // `base64 < file` (stdin redirect) rather than `base64 file`: the bare
+  // file-argument form is rejected by BSD/macOS base64, while the redirect works
+  // on both it and GNU coreutils.
+  const result = await handle.exec(`base64 < ${JSON.stringify(sandboxPath)}`);
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `failed to read sandbox file ${sandboxPath} (${tag}): ${result.stderr.trim()}`,
+    );
   }
+  return Buffer.from(result.stdout, "base64").toString("utf-8");
 };
 
 const writeSandboxFile = async (
@@ -344,7 +351,7 @@ const copyClaudeSessionFile = async ({
   tag,
   redact = (t) => t,
 }: {
-  handle: Pick<BindMountSandboxHandle, "copyFileOut">;
+  handle: Pick<BindMountSandboxHandle, "exec">;
   sourcePath: string;
   fromCwd: string;
   toCwd: string;

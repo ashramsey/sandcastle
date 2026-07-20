@@ -78,19 +78,27 @@ Worktree methods (`wt.run()`, `wt.interactive()`, `wt.createSandbox()`) accept t
 
 **Bind-mount hardening.** The bind-mount providers (Docker, Podman) mount the host repo's `.git/hooks` and `.git/config` **read-only** so a prompt-injected agent cannot plant a git hook or a code-executing config entry (`core.hooksPath`, an executable `alias`, an external diff/filter driver, etc.) that would later run as the developer on the host. Commits are unaffected — they write objects and refs, not hooks or config. This blocks in-sandbox repo-local config writes (`git remote add`, `git config --local`, tracking-branch creation); trusted workflows that need those can opt out by setting `SANDCASTLE_ALLOW_GIT_CONFIG_WRITES=1`.
 
-**Run-line hardening.** By default the bind-mount providers also drop privilege and bound resources on the container: `--cap-drop=ALL` (the stock image needs no Linux capabilities), `--security-opt no-new-privileges` (blocks setuid escalation), and `--pids-limit 2048` (fork-bomb protection, generous enough not to throttle parallel builds). These are grouped under a `hardening` option, each field overridable, and there is no default `--memory` ceiling so a legitimate heavy build is never OOM-killed:
+**Run-line hardening.** By default the bind-mount providers also drop privilege and bound resources on the container: `--cap-drop=ALL` (the stock image needs no Linux capabilities), `--security-opt no-new-privileges` (blocks setuid escalation), `--pids-limit 2048` (fork-bomb protection, generous enough not to throttle parallel builds), and a `--read-only` root filesystem paired with `--tmpfs` mounts for exactly the paths a real agent writes (so a subverted agent can't tamper with the baked-in tooling/binaries mid-run). These are grouped under a `hardening` option, each field overridable, and there is no default `--memory` ceiling so a legitimate heavy build is never OOM-killed:
 
-| `hardening` field | Default   | Notes                                                         |
-| ----------------- | --------- | ------------------------------------------------------------- |
-| `capDrop`         | `["ALL"]` | Capabilities to drop. `[]` drops none.                        |
-| `capAdd`          | `[]`      | Add specific capabilities back (e.g. `["NET_BIND_SERVICE"]`). |
-| `noNewPrivileges` | `true`    | `false` omits the flag.                                       |
-| `pidsLimit`       | `2048`    | A number to override, or `false` to remove the limit.         |
-| `memory`          | —         | Opt-in ceiling, e.g. `"8g"`. Omitted unless set.              |
+| `hardening` field | Default          | Notes                                                                                 |
+| ----------------- | ---------------- | ------------------------------------------------------------------------------------- |
+| `capDrop`         | `["ALL"]`        | Capabilities to drop. `[]` drops none.                                                |
+| `capAdd`          | `[]`             | Add specific capabilities back (e.g. `["NET_BIND_SERVICE"]`).                         |
+| `noNewPrivileges` | `true`           | `false` omits the flag.                                                               |
+| `pidsLimit`       | `2048`           | A number to override, or `false` to remove the limit.                                 |
+| `memory`          | —                | Opt-in ceiling, e.g. `"8g"`. Omitted unless set.                                      |
+| `readOnlyRootfs`  | `true`           | `--read-only` rootfs. `false` omits it (and the default tmpfs).                       |
+| `tmpfs`           | writable set (↓) | `--tmpfs` scratch paths. Array of raw specs (`"/p"` / `"/p:opts"`); `[]` mounts none. |
+
+The default `tmpfs` set is `/tmp`, `~/.cache`, `~/.config`, `~/.npm`, and `~/.claude` — the directories a live agent run writes — each mounted `mode=1777` (world-writable + sticky, like `/tmp`) so the non-root `agent` user can write to them (a bare `--tmpfs` is root-owned and would otherwise reject the agent's writes). A blanket `--tmpfs /home/agent` is intentionally avoided because it would shadow the Claude CLI baked into `~/.local`. Two config **files** at the home-dir root — Claude's `~/.claude.json` and git's `~/.gitconfig` (the latter written by Sandcastle's own `git config --global` setup for `safe.directory` + `user.name`/`user.email`) — that `--tmpfs` (directories only) can't cover and a read-only rootfs blocks; so under the default read-only rootfs the Docker/Podman providers point `CLAUDE_CONFIG_DIR` at the `~/.claude` tmpfs and `GIT_CONFIG_GLOBAL` at a file in the `~/.config` tmpfs, keeping both on a writable mount. Set your own `CLAUDE_CONFIG_DIR` / `GIT_CONFIG_GLOBAL` via the provider `env` to override.
 
 ```typescript
 // Trusted workflow that needs a raised port and a memory ceiling:
 docker({ hardening: { capAdd: ["NET_BIND_SERVICE"], memory: "8g" } });
+
+// Disable the read-only rootfs, or add an extra writable scratch path:
+docker({ hardening: { readOnlyRootfs: false } });
+docker({ hardening: { tmpfs: ["/tmp", "/home/agent/.cache", "/scratch"] } });
 ```
 
 **Secret redaction.** Injected credentials (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`) and user-declared secrets — env keys whose names look sensitive (`*_TOKEN`, `*_SECRET`, `*PASSWORD*`, `*API_KEY*`, and similar) — are masked with `[redacted]` before they are written to the verbose run log or to the captured session `.jsonl` transcripts on the host. This narrows the blast radius of a single leaked line persisted to disk. It is defense-in-depth, not a substitute for scoping tokens down to short-lived, least-privilege credentials.

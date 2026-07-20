@@ -156,8 +156,16 @@ export interface PodmanOptions {
   /**
    * Privilege- and resource-hardening flags for the container run line. Every
    * field defaults to a hardened value (`--cap-drop=ALL`, `--security-opt
-   * no-new-privileges`, `--pids-limit 2048`); `--memory` is opt-in with no
-   * default. Omit to accept the hardened defaults. See {@link RunHardeningOptions}.
+   * no-new-privileges`, `--pids-limit 2048`, `--read-only` rootfs with `--tmpfs`
+   * for the paths a real agent writes); `--memory` is opt-in with no default.
+   * Omit to accept the hardened defaults. See {@link RunHardeningOptions}.
+   *
+   * With the default read-only rootfs, this provider also relocates the two
+   * config files that live at the read-only home-dir root onto writable tmpfs:
+   * `CLAUDE_CONFIG_DIR` -> the `~/.claude` tmpfs (normally `~/.claude.json`), and
+   * `GIT_CONFIG_GLOBAL` -> a file in the `~/.config` tmpfs (normally
+   * `~/.gitconfig`, written by Sandcastle's `git config --global` setup). Set
+   * either via {@link PodmanOptions.env} to override.
    */
   readonly hardening?: RunHardeningOptions;
   /**
@@ -241,7 +249,27 @@ export const podman = (options?: PodmanOptions): SandboxProvider => {
       // Pre-flight: verify image exists locally
       await checkImageExists(imageName);
 
-      const env = { ...createOptions.env, HOME: "/home/agent" };
+      // Under the default read-only rootfs, two config files at the home-dir
+      // root can't be written and no directory `--tmpfs` can cover them:
+      //  - Claude's `~/.claude.json` -> point CLAUDE_CONFIG_DIR at the `~/.claude`
+      //    tmpfs dir.
+      //  - git's `~/.gitconfig` (written by Sandcastle's own `git config --global`
+      //    for safe.directory + user.name/email) -> point GIT_CONFIG_GLOBAL at a
+      //    file inside the `~/.config` tmpfs. It must sit directly in an existing
+      //    tmpfs mount root because `git config` won't create missing parents.
+      // Both land the state on a writable mount; the caller's env wins if it sets
+      // either variable itself.
+      const readOnlyRootfs = options?.hardening?.readOnlyRootfs ?? true;
+      const env = {
+        ...(readOnlyRootfs
+          ? {
+              CLAUDE_CONFIG_DIR: "/home/agent/.claude",
+              GIT_CONFIG_GLOBAL: "/home/agent/.config/gitconfig",
+            }
+          : {}),
+        ...createOptions.env,
+        HOME: "/home/agent",
+      };
       const envArgs = Object.entries(env).flatMap(([key, value]) => [
         "-e",
         `${key}=${value}`,
