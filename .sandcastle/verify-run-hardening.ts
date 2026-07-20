@@ -13,12 +13,18 @@
  *     - SecurityOpt      includes "no-new-privileges"
  *     - PidsLimit        == 2048  (the generous default)
  *     - Memory           == 0     (no default ceiling — opt-in only)
- *     with an override sandbox proving Memory / PidsLimit / CapAdd are honored.
+ *     - ReadonlyRootfs   == true  (ticket 10 — read-only rootfs by default)
+ *     - Tmpfs            includes /tmp + ~/.claude (ticket 10 — writable set)
+ *     with an override sandbox proving Memory / PidsLimit / CapAdd are honored,
+ *     plus a `readOnlyRootfs: false` sandbox proving the rootfs opt-out.
  *
- *   FUNCTIONAL (the agent workflow still succeeds under the hardened defaults):
+ *   FUNCTIONAL (the agent workflow still succeeds under the hardened defaults —
+ *   note these writes land on the tmpfs mounts under the read-only rootfs):
  *     - edit a file and `git commit` in the worktree          SUCCEEDS
  *     - write agent session state under ~/.claude             SUCCEEDS
  *     - write a package-manager cache dir (~/.npm)            SUCCEEDS
+ *     - `git config --global` write (~/.gitconfig relocation) SUCCEEDS
+ *     - a write OUTSIDE the tmpfs set (e.g. ~/probe) is REJECTED by read-only
  *
  * `exec()` returns the full ExecResult (a non-zero exit is surfaced, not
  * thrown), which is what lets us assert on success/failure.
@@ -91,6 +97,8 @@ interface HostConfig {
   SecurityOpt: string[] | null;
   PidsLimit: number | null;
   Memory: number;
+  ReadonlyRootfs: boolean;
+  Tmpfs: Record<string, string> | null;
 }
 
 /** Inspect the single running sandbox container spawned from IMAGE. */
@@ -155,8 +163,22 @@ try {
       hc.Memory === 0,
       String(hc.Memory),
     );
+    check(
+      "default ReadonlyRootfs == true",
+      hc.ReadonlyRootfs === true,
+      String(hc.ReadonlyRootfs),
+    );
+    const tmpfsPaths = Object.keys(hc.Tmpfs ?? {});
+    check(
+      "default Tmpfs covers /tmp and ~/.claude (not a blanket /home/agent)",
+      tmpfsPaths.includes("/tmp") &&
+        tmpfsPaths.includes("/home/agent/.claude") &&
+        !tmpfsPaths.includes("/home/agent"),
+      JSON.stringify(tmpfsPaths),
+    );
 
     // Functional: a normal agent run must still succeed under the defaults.
+    // These writes land on the tmpfs mounts; a write outside them must fail.
     await sandboxA.exec(
       'git config --global --add safe.directory "$(pwd)" && ' +
         "git config --global user.email a@b.c && git config --global user.name A",
@@ -181,6 +203,29 @@ try {
       "package-manager cache write (~/.npm) succeeds",
       npmCache.exitCode === 0 && npmCache.stdout.trim() === "ok",
       npmCache.stderr.trim(),
+    );
+
+    // `git config --global` writes ~/.gitconfig, a FILE at the read-only home
+    // root that no directory tmpfs can cover. Sandcastle runs it at startup
+    // (safe.directory + user.name/email), so GIT_CONFIG_GLOBAL must relocate it
+    // onto a writable tmpfs. This is exit-checked (unlike the setup above)
+    // because a read-only ~/.gitconfig is exactly what broke the live agent run.
+    const gitGlobal = await sandboxA.exec(
+      "git config --global user.name verify-probe && " +
+        "git config --global --get user.name",
+    );
+    check(
+      "git config --global write (~/.gitconfig relocation) succeeds",
+      gitGlobal.exitCode === 0 && gitGlobal.stdout.trim() === "verify-probe",
+      `exit=${gitGlobal.exitCode} ${gitGlobal.stderr.trim()}`,
+    );
+
+    // The read-only rootfs must actually reject a write outside the tmpfs set.
+    const rejected = await sandboxA.exec("echo nope > ~/probe-outside-tmpfs");
+    check(
+      "write outside the tmpfs set is rejected by the read-only rootfs",
+      rejected.exitCode !== 0,
+      `exit=${rejected.exitCode} ${rejected.stderr.trim()}`,
     );
   } finally {
     await sandboxA.close();
@@ -220,6 +265,42 @@ try {
     );
   } finally {
     await sandboxB.close();
+  }
+
+  // ---- (C) read-only rootfs OPT-OUT ----
+  const sandboxC = await createSandbox({
+    sandbox: docker({
+      imageName: IMAGE,
+      hardening: { readOnlyRootfs: false },
+    }),
+    // PODMAN: sandbox: podman({ imageName: IMAGE, hardening: { readOnlyRootfs: false } }),
+    cwd: repo,
+    branch: "verify-harden-c",
+  });
+
+  try {
+    const hc = inspectSandboxHostConfig();
+    check(
+      "readOnlyRootfs: false → ReadonlyRootfs == false",
+      hc.ReadonlyRootfs === false,
+      String(hc.ReadonlyRootfs),
+    );
+    check(
+      "readOnlyRootfs: false → no default tmpfs mounts",
+      Object.keys(hc.Tmpfs ?? {}).length === 0,
+      JSON.stringify(hc.Tmpfs),
+    );
+    // With the rootfs writable, a write outside the (now absent) tmpfs succeeds.
+    const write = await sandboxC.exec(
+      "echo ok > ~/probe-writable && cat ~/probe-writable",
+    );
+    check(
+      "with read-only disabled, a home-dir write succeeds",
+      write.exitCode === 0 && write.stdout.trim() === "ok",
+      write.stderr.trim(),
+    );
+  } finally {
+    await sandboxC.close();
   }
 } finally {
   rmSync(repo, { recursive: true, force: true });

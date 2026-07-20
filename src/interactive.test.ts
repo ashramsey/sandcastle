@@ -212,6 +212,15 @@ describe("interactive()", () => {
     expect(result.exitCode).toBe(42);
   });
 
+  it("throws when no sandbox provider is given (no silent no-sandbox)", async () => {
+    await expect(
+      interactive({
+        agent: claudeCode("claude-opus-4-8"),
+        prompt: "test",
+      }),
+    ).rejects.toThrow(/requires an explicit sandbox provider/);
+  });
+
   it("throws when provider does not implement interactiveExec", async () => {
     const provider = createBindMountSandboxProvider({
       name: "no-interactive",

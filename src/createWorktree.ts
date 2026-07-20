@@ -41,6 +41,7 @@ import { orchestrate, type IterationResult } from "./Orchestrator.js";
 import { agentStreamEmitterLayer } from "./AgentStreamEmitter.js";
 import { resolveEnv } from "./EnvResolver.js";
 import { mergeProviderEnv } from "./mergeProviderEnv.js";
+import { createEnvSecretRedactor } from "./redactSecrets.js";
 import { startSandbox } from "./startSandbox.js";
 import { syncOut } from "./syncOut.js";
 import * as WorktreeManager from "./WorktreeManager.js";
@@ -54,7 +55,7 @@ import {
   validateNoBuiltInArgOverride,
   BUILT_IN_PROMPT_ARG_KEYS,
 } from "./PromptArgumentSubstitution.js";
-import { noSandbox } from "./sandboxes/no-sandbox.js";
+import { requireExplicitSandbox } from "./requireExplicitSandbox.js";
 import { raceAbortSignal } from "./raceAbortSignal.js";
 import type { Timeouts } from "./run.js";
 
@@ -88,7 +89,13 @@ export interface CreateWorktreeOptions {
 export interface WorktreeInteractiveOptions {
   /** Agent provider to use (e.g. claudeCode("claude-opus-4-8")) */
   readonly agent: AgentProvider;
-  /** Sandbox provider (e.g. docker(), noSandbox()). Defaults to noSandbox(). */
+  /**
+   * Sandbox provider (e.g. `docker()`, `noSandbox()`).
+   *
+   * Required — there is no silent default. Pass a real provider to sandbox the
+   * agent, or an explicit `noSandbox()` to deliberately run it on the host.
+   * Omitting it throws.
+   */
   readonly sandbox?: AnySandboxProvider;
   /** Inline prompt string (mutually exclusive with promptFile). */
   readonly prompt?: string;
@@ -285,7 +292,10 @@ export const createWorktree = async (
     opts.signal?.throwIfAborted();
 
     const { prompt, promptFile, hooks, agent: provider } = opts;
-    const resolvedSandbox = opts.sandbox ?? noSandbox();
+    const resolvedSandbox = requireExplicitSandbox(
+      opts.sandbox,
+      "wt.interactive()",
+    );
 
     // Validate buildInteractiveArgs is available
     if (!provider.buildInteractiveArgs) {
@@ -529,6 +539,10 @@ export const createWorktree = async (
       });
       const effectiveEnv = { ...env, ...(opts.env ?? {}) };
 
+      // Mask injected credentials and user-declared secrets (incl. per-run
+      // `opts.env` overrides) before they reach the run log or transcripts (h07).
+      const redact = createEnvSecretRedactor(effectiveEnv);
+
       // 3. Prompt args substitution (skipped for inline prompts — passthrough)
       const userArgs = opts.promptArgs ?? {};
       let resolvedPrompt: string;
@@ -654,7 +668,7 @@ export const createWorktree = async (
       });
 
       const streamEmitterLayer = agentStreamEmitterLayer(
-        buildAgentStreamHandler(resolvedLogging),
+        buildAgentStreamHandler(resolvedLogging, redact),
       );
 
       const runLayer = Layer.mergeAll(
@@ -678,6 +692,7 @@ export const createWorktree = async (
           // pin to the worktree's branch so commits stay there.
           branch: isMergeToHead ? undefined : worktreeInfo.branch,
           provider,
+          redact,
           completionSignal: opts.completionSignal,
           idleTimeoutSeconds: opts.idleTimeoutSeconds,
           completionTimeoutSeconds: opts.completionTimeoutSeconds,

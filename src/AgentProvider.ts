@@ -21,6 +21,7 @@ import {
   type HostSessionLookup,
 } from "./SessionStore.js";
 import type { BindMountSandboxHandle } from "./SandboxProvider.js";
+import type { Redactor } from "./redactSecrets.js";
 
 const fileExists = async (path: string): Promise<boolean> => {
   try {
@@ -237,6 +238,12 @@ export interface AgentSessionStorage {
     sandboxCwd: string;
     sessionId: string;
     handle: BindMountSandboxHandle;
+    /**
+     * Masks known secret values in the transcript before it is written to the
+     * host store (h07). Applied to the already-rewritten JSON string, so
+     * masking a quoted secret keeps the JSON valid. Defaults to identity.
+     */
+    redact?: Redactor;
   }): Promise<void>;
   /** Transfer a session JSONL from the host store into the sandbox. */
   resumeIntoSandbox(args: {
@@ -286,20 +293,27 @@ export const DEFAULT_MODEL = "claude-opus-4-8";
 // ---------------------------------------------------------------------------
 
 const readSandboxFile = async (
-  handle: Pick<BindMountSandboxHandle, "copyFileOut">,
+  handle: Pick<BindMountSandboxHandle, "exec">,
   sandboxPath: string,
   tag: string,
 ): Promise<string> => {
-  const tmpPath = join(
-    tmpdir(),
-    `sandcastle-${tag}-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`,
-  );
-  await handle.copyFileOut(sandboxPath, tmpPath);
-  try {
-    return await readFile(tmpPath, "utf-8");
-  } finally {
-    await rm(tmpPath, { force: true }).catch(() => {});
+  // Read the file with `base64` over `exec` (i.e. inside the container's mount
+  // namespace) rather than `docker cp`. Under the hardened read-only rootfs the
+  // agent's session state lands on a `--tmpfs` mount, and `docker cp` cannot
+  // read tmpfs mounts — it archives the layered rootfs plus bind/volume mounts
+  // only, so it reports the file as missing. base64 also keeps the transfer
+  // byte-exact: its ASCII output can't be mangled by the per-chunk UTF-8
+  // decoding in the exec plumbing, which a raw `cat` of multibyte JSONL could.
+  // `base64 < file` (stdin redirect) rather than `base64 file`: the bare
+  // file-argument form is rejected by BSD/macOS base64, while the redirect works
+  // on both it and GNU coreutils.
+  const result = await handle.exec(`base64 < ${JSON.stringify(sandboxPath)}`);
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `failed to read sandbox file ${sandboxPath} (${tag}): ${result.stderr.trim()}`,
+    );
   }
+  return Buffer.from(result.stdout, "base64").toString("utf-8");
 };
 
 const writeSandboxFile = async (
@@ -335,16 +349,18 @@ const copyClaudeSessionFile = async ({
   toCwd,
   destPath,
   tag,
+  redact = (t) => t,
 }: {
-  handle: Pick<BindMountSandboxHandle, "copyFileOut">;
+  handle: Pick<BindMountSandboxHandle, "exec">;
   sourcePath: string;
   fromCwd: string;
   toCwd: string;
   destPath: string;
   tag: string;
+  redact?: Redactor;
 }): Promise<void> => {
   const jsonl = await readSandboxFile(handle, sourcePath, tag);
-  const rewritten = transferClaudeSession(jsonl, fromCwd, toCwd);
+  const rewritten = redact(transferClaudeSession(jsonl, fromCwd, toCwd));
   await mkdir(dirname(destPath), { recursive: true });
   await writeFile(destPath, rewritten);
 };
@@ -367,7 +383,13 @@ const makeClaudeSessionStorage = (
       if (!(await fileExists(path))) return undefined;
       return readFile(path, "utf-8");
     },
-    captureToHost: async ({ hostCwd, sandboxCwd, sessionId, handle }) => {
+    captureToHost: async ({
+      hostCwd,
+      sandboxCwd,
+      sessionId,
+      handle,
+      redact,
+    }) => {
       // Main session: failure is fatal — the user expects their session.
       await copyClaudeSessionFile({
         handle,
@@ -380,6 +402,7 @@ const makeClaudeSessionStorage = (
         toCwd: hostCwd,
         destPath: claudeHostSessionPath(hostCwd, sessionId, hostProjectsDir),
         tag: "claude-cap",
+        redact,
       });
 
       // Subagent / workflow transcripts: best-effort. A missing `subagents/`
@@ -409,6 +432,7 @@ const makeClaudeSessionStorage = (
               posix.basename(sandboxSubagentPath),
             ),
             tag: "claude-sub",
+            redact,
           });
         } catch (err) {
           console.error(
@@ -462,14 +486,22 @@ const makeCodexSessionStorage = (
       if (!found.path) return undefined;
       return readFile(found.path, "utf-8");
     },
-    captureToHost: async ({ hostCwd, sandboxCwd, sessionId, handle }) => {
+    captureToHost: async ({
+      hostCwd,
+      sandboxCwd,
+      sessionId,
+      handle,
+      redact = (t) => t,
+    }) => {
       const located = await locateCodexSandboxSession(
         sessionId,
         handle,
         sandboxSessionsDir,
       );
       const jsonl = await readSandboxFile(handle, located.path, "codex-cap");
-      const rewritten = transferCodexSession(jsonl, sandboxCwd, hostCwd);
+      const rewritten = redact(
+        transferCodexSession(jsonl, sandboxCwd, hostCwd),
+      );
       const root =
         hostSessionsDir ?? join(process.env.HOME ?? "~", ".codex", "sessions");
       const target = join(root, located.relativePath);
@@ -509,14 +541,20 @@ const makePiSessionStorage = (options?: PiOptions): AgentSessionStorage => {
       if (!found.path) return undefined;
       return readFile(found.path, "utf-8");
     },
-    captureToHost: async ({ hostCwd, sandboxCwd, sessionId, handle }) => {
+    captureToHost: async ({
+      hostCwd,
+      sandboxCwd,
+      sessionId,
+      handle,
+      redact = (t) => t,
+    }) => {
       const located = await locatePiSandboxSession(
         sessionId,
         handle,
         sandboxSessionsDir,
       );
       const jsonl = await readSandboxFile(handle, located.path, "pi-cap");
-      const rewritten = transferPiSession(jsonl, sandboxCwd, hostCwd);
+      const rewritten = redact(transferPiSession(jsonl, sandboxCwd, hostCwd));
       // Pi resolves `--session <id>` against the *current project's* encoded
       // directory first; a transferred file in any other directory hits the
       // "fork session?" prompt, which hangs in print/json mode. So we land

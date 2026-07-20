@@ -138,6 +138,213 @@ describe("docker()", () => {
     expect(provider.tag).toBe("bind-mount");
   });
 
+  describe("egress control — emitted --network flags (h03)", () => {
+    const runDocker = async (options?: Parameters<typeof docker>[0]) => {
+      mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
+        const callback = rest[rest.length - 1];
+        callback(null, "", "");
+        return undefined as any;
+      });
+      const provider = docker(options);
+      const handle = await provider.create({
+        worktreePath: "/tmp/worktree",
+        hostRepoPath: "/tmp/repo",
+        mounts: [
+          { hostPath: "/tmp/worktree", sandboxPath: "/home/agent/workspace" },
+        ],
+        env: {},
+      });
+      const runArgs = mockExecFile.mock.calls.find(
+        ([, args]) => Array.isArray(args) && args[0] === "run",
+      )?.[1] as string[];
+      await handle.close();
+      return runArgs;
+    };
+
+    it("emits no --network flag when network is omitted (default bridge)", async () => {
+      const runArgs = await runDocker();
+      expect(runArgs).not.toContain("--network");
+    });
+
+    it("emits --network for a custom egress-proxy network (string)", async () => {
+      const runArgs = await runDocker({ network: "egress-internal" });
+      const idx = runArgs.indexOf("--network");
+      expect(idx).toBeGreaterThan(-1);
+      expect(runArgs[idx + 1]).toBe("egress-internal");
+    });
+
+    it("emits multiple --network flags for an array in order", async () => {
+      const runArgs = await runDocker({ network: ["net1", "net2"] });
+      const firstIdx = runArgs.indexOf("--network");
+      expect(firstIdx).toBeGreaterThan(-1);
+      expect(runArgs[firstIdx + 1]).toBe("net1");
+      const secondIdx = runArgs.indexOf("--network", firstIdx + 1);
+      expect(secondIdx).toBeGreaterThan(-1);
+      expect(runArgs[secondIdx + 1]).toBe("net2");
+    });
+
+    it("emits --network none for the fully-offline posture", async () => {
+      const runArgs = await runDocker({ network: "none" });
+      const idx = runArgs.indexOf("--network");
+      expect(idx).toBeGreaterThan(-1);
+      expect(runArgs[idx + 1]).toBe("none");
+    });
+  });
+
+  describe("read-only rootfs (h10)", () => {
+    const runDocker = async (
+      options?: Parameters<typeof docker>[0],
+      createEnv: Record<string, string> = {},
+    ) => {
+      mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
+        const callback = rest[rest.length - 1];
+        callback(null, "", "");
+        return undefined as any;
+      });
+      const provider = docker(options);
+      const handle = await provider.create({
+        worktreePath: "/tmp/worktree",
+        hostRepoPath: "/tmp/repo",
+        mounts: [
+          { hostPath: "/tmp/worktree", sandboxPath: "/home/agent/workspace" },
+        ],
+        env: createEnv,
+      });
+      const runArgs = mockExecFile.mock.calls.find(
+        ([, args]) => Array.isArray(args) && args[0] === "run",
+      )?.[1] as string[];
+      await handle.close();
+      return runArgs;
+    };
+
+    /** The value of the `-e KEY=...` flag (undefined if the key is absent). */
+    const envValue = (args: string[], key: string): string | undefined => {
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] === "-e" && args[i + 1]?.startsWith(`${key}=`)) {
+          return args[i + 1]!.slice(key.length + 1);
+        }
+      }
+      return undefined;
+    };
+
+    it("emits --read-only and tmpfs mounts by default", async () => {
+      const runArgs = await runDocker();
+      expect(runArgs).toContain("--read-only");
+      const tmpfs: string[] = [];
+      for (let i = 0; i < runArgs.length; i++) {
+        if (runArgs[i] === "--tmpfs") tmpfs.push(runArgs[i + 1]!);
+      }
+      // mode=1777 makes the mounts writable by the non-root agent user.
+      expect(tmpfs).toContain("/tmp:mode=1777");
+      expect(tmpfs).toContain("/home/agent/.claude:mode=1777");
+      expect(tmpfs).not.toContain("/home/agent");
+    });
+
+    it("defaults CLAUDE_CONFIG_DIR and GIT_CONFIG_GLOBAL to tmpfs paths under read-only", async () => {
+      const runArgs = await runDocker();
+      expect(envValue(runArgs, "CLAUDE_CONFIG_DIR")).toBe(
+        "/home/agent/.claude",
+      );
+      // ~/.gitconfig is a read-only home-root file; relocate it onto ~/.config tmpfs.
+      expect(envValue(runArgs, "GIT_CONFIG_GLOBAL")).toBe(
+        "/home/agent/.config/gitconfig",
+      );
+    });
+
+    it("lets the caller's CLAUDE_CONFIG_DIR / GIT_CONFIG_GLOBAL win over the default", async () => {
+      const runArgs = await runDocker(
+        {},
+        {
+          CLAUDE_CONFIG_DIR: "/custom/cfg",
+          GIT_CONFIG_GLOBAL: "/custom/gitconfig",
+        },
+      );
+      expect(envValue(runArgs, "CLAUDE_CONFIG_DIR")).toBe("/custom/cfg");
+      expect(envValue(runArgs, "GIT_CONFIG_GLOBAL")).toBe("/custom/gitconfig");
+    });
+
+    it("omits --read-only, tmpfs, and the config-relocation defaults when disabled", async () => {
+      const runArgs = await runDocker({
+        hardening: { readOnlyRootfs: false },
+      });
+      expect(runArgs).not.toContain("--read-only");
+      expect(runArgs).not.toContain("--tmpfs");
+      expect(envValue(runArgs, "CLAUDE_CONFIG_DIR")).toBeUndefined();
+      expect(envValue(runArgs, "GIT_CONFIG_GLOBAL")).toBeUndefined();
+    });
+
+    it("drops the config relocation when a tmpfs override removes its backing mount", async () => {
+      // readOnlyRootfs stays true, but a custom tmpfs set no longer includes
+      // ~/.claude or ~/.config — so we must NOT leave CLAUDE_CONFIG_DIR /
+      // GIT_CONFIG_GLOBAL pointing config at the now-read-only rootfs.
+      const runArgs = await runDocker({
+        hardening: { tmpfs: ["/tmp:mode=1777"] },
+      });
+      expect(runArgs).toContain("--read-only");
+      expect(envValue(runArgs, "CLAUDE_CONFIG_DIR")).toBeUndefined();
+      expect(envValue(runArgs, "GIT_CONFIG_GLOBAL")).toBeUndefined();
+    });
+  });
+
+  describe("host-access gate (h06)", () => {
+    it("throws at construction for a host-access hatch without the ack flag", () => {
+      expect(() => docker({ network: "host" })).toThrow(
+        /allowDangerousHostAccess: true/,
+      );
+      expect(() => docker({ groups: ["docker"] })).toThrow(
+        /allowDangerousHostAccess: true/,
+      );
+      expect(() => docker({ devices: ["/dev/kvm"] })).toThrow(
+        /allowDangerousHostAccess: true/,
+      );
+    });
+
+    it("throws for a Docker-socket mount without the ack flag", () => {
+      expect(() =>
+        docker({
+          mounts: [
+            {
+              hostPath: "/var/run/docker.sock",
+              sandboxPath: "/var/run/docker.sock",
+            },
+          ],
+        }),
+      ).toThrow(/allowDangerousHostAccess: true/);
+    });
+
+    it("does NOT gate a custom network or network: 'none'", () => {
+      expect(() => docker({ network: "my-egress-proxy" })).not.toThrow();
+      expect(() => docker({ network: "none" })).not.toThrow();
+    });
+
+    it("allows the hatch when allowDangerousHostAccess is set", () => {
+      expect(() =>
+        docker({ network: "host", allowDangerousHostAccess: true }),
+      ).not.toThrow();
+    });
+
+    it("warns (but does not throw) on an acknowledged socket mount", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        expect(() =>
+          docker({
+            mounts: [
+              {
+                hostPath: "/var/run/docker.sock",
+                sandboxPath: "/var/run/docker.sock",
+              },
+            ],
+            allowDangerousHostAccess: true,
+          }),
+        ).not.toThrow();
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy.mock.calls[0]![0]).toContain("host root");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+  });
+
   it("passes --group-add flags to docker run, stringifying numeric GIDs", async () => {
     mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
       const callback = rest[rest.length - 1];
@@ -145,7 +352,10 @@ describe("docker()", () => {
       return undefined as any;
     });
 
-    const provider = docker({ groups: ["docker", 999] });
+    const provider = docker({
+      groups: ["docker", 999],
+      allowDangerousHostAccess: true,
+    });
     const handle = await provider.create({
       worktreePath: "/tmp/worktree",
       hostRepoPath: "/tmp/repo",
@@ -202,7 +412,10 @@ describe("docker()", () => {
       return undefined as any;
     });
 
-    const provider = docker({ devices: ["/dev/kvm", "/dev/fuse"] });
+    const provider = docker({
+      devices: ["/dev/kvm", "/dev/fuse"],
+      allowDangerousHostAccess: true,
+    });
     const handle = await provider.create({
       worktreePath: "/tmp/worktree",
       hostRepoPath: "/tmp/repo",

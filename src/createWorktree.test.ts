@@ -362,6 +362,29 @@ describe("worktree.interactive()", () => {
     }
   });
 
+  it("throws when no sandbox provider is given (no silent no-sandbox)", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "ws-interactive-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "init.txt", "init", "initial commit");
+
+    const ws = await createWorktree({
+      branchStrategy: { type: "branch", branch: "interactive-no-sandbox" },
+      cwd: hostDir,
+    });
+
+    try {
+      await expect(
+        ws.interactive({
+          agent: claudeCode("claude-opus-4-8"),
+          prompt: "test prompt",
+        }),
+      ).rejects.toThrow(/requires an explicit sandbox provider/);
+    } finally {
+      await ws.close();
+      await rm(hostDir, { recursive: true, force: true });
+    }
+  });
+
   it("accepts explicit sandbox parameter", async () => {
     const hostDir = await mkdtemp(join(tmpdir(), "ws-interactive-"));
     await initRepo(hostDir);

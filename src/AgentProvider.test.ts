@@ -12,6 +12,7 @@ import {
 } from "./AgentProvider.js";
 import type { AgentCommandOptions } from "./AgentProvider.js";
 import type { BindMountSandboxHandle } from "./SandboxProvider.js";
+import { createSecretRedactor } from "./redactSecrets.js";
 
 /** Shorthand: build options with dangerouslySkipPermissions: true (mirrors existing sandbox callers). */
 const opts = (prompt: string): AgentCommandOptions => ({
@@ -2223,6 +2224,68 @@ describe("sessionStorage", () => {
     }
   });
 
+  it("captureToHost masks a secret in the transcript before writing, keeping the JSONL parseable (h07)", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "sandcastle-pi-redact-host-"));
+    const sandboxDir = await mkdtemp(
+      join(tmpdir(), "sandcastle-pi-redact-sbx-"),
+    );
+    try {
+      const id = "9ba1c695-2222-4444-8888-e7e847bf34dd";
+      const sandboxCwd = "/sandbox/repo";
+      const hostCwd = "/host/repo";
+      const secret = "sk-ant-supersecrettoken-0123456789";
+      const filename = `2026-05-29T08-00-00_${id}.jsonl`;
+      const sandboxSessionDir = join(sandboxDir, "--sandbox-repo--");
+      await mkdir(sandboxSessionDir, { recursive: true });
+      const sandboxPath = join(sandboxSessionDir, filename);
+      const jsonl = [
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id,
+          timestamp: "2026-05-29T08:00:00Z",
+          cwd: sandboxCwd,
+        }),
+        JSON.stringify({
+          type: "message",
+          role: "assistant",
+          content: [{ type: "text", text: `the key is ${secret} ok` }],
+        }),
+      ].join("\n");
+      await writeFile(sandboxPath, jsonl);
+
+      const provider = pi("claude-sonnet-4-6", {
+        sessionStorage: {
+          hostSessionsDir: hostDir,
+          sandboxSessionsDir: sandboxDir,
+        },
+      });
+
+      await provider.sessionStorage!.captureToHost({
+        hostCwd,
+        sandboxCwd,
+        sessionId: id,
+        handle: fsBindMountHandle(),
+        redact: createSecretRedactor([secret]),
+      });
+
+      const expectedHostPath = join(hostDir, "--host-repo--", filename);
+      const content = await readFile(expectedHostPath, "utf-8");
+      // The secret is gone; the placeholder is present.
+      expect(content).not.toContain(secret);
+      expect(content).toContain("[redacted]");
+      // The redacted transcript is still valid JSONL — each line parses.
+      const lines = content.split("\n");
+      const message = JSON.parse(lines[1]!);
+      expect(message.content[0].text).toBe("the key is [redacted] ok");
+      // cwd rewrite still happened on the header line.
+      expect(JSON.parse(lines[0]!).cwd).toBe(hostCwd);
+    } finally {
+      await rm(hostDir, { recursive: true, force: true });
+      await rm(sandboxDir, { recursive: true, force: true });
+    }
+  });
+
   it("pi resumeIntoSandbox transfers a host session into the sandbox-cwd-encoded dir with cwd rewritten", async () => {
     const hostDir = await mkdtemp(join(tmpdir(), "sandcastle-pi-resume-host-"));
     const sandboxDir = await mkdtemp(
@@ -2396,6 +2459,69 @@ describe("sessionStorage", () => {
     }
   });
 
+  it("claudeCode captureToHost reads the session via exec (not copyFileOut) so it works on a read-only-rootfs tmpfs mount (h10)", async () => {
+    const hostDir = await mkdtemp(
+      join(tmpdir(), "sandcastle-claude-tmpfs-read-"),
+    );
+    const sandboxDir = await mkdtemp(
+      join(tmpdir(), "sandcastle-claude-tmpfs-read-sbx-"),
+    );
+    try {
+      const id = "session-tmpfs";
+      const hostCwd = "/host/repo";
+      const sandboxCwd = "/sandbox/repo";
+      const sandboxProjectDir = join(sandboxDir, "-sandbox-repo");
+      await mkdir(sandboxProjectDir, { recursive: true });
+      // A multibyte payload proves the base64 round-trip is byte-exact and not
+      // mangled by the per-chunk UTF-8 decoding in the exec plumbing.
+      const marker = "café-\u{1F510}-Ω";
+      await writeFile(
+        join(sandboxProjectDir, `${id}.jsonl`),
+        JSON.stringify({ type: "system", cwd: sandboxCwd, marker }),
+      );
+
+      // Under a read-only rootfs the session lives on a tmpfs that `docker cp`
+      // (copyFileOut) cannot read; fail copyFileOut outright to prove capture
+      // never touches it and reads via exec instead.
+      const base = fsBindMountHandle();
+      const execCommands: string[] = [];
+      const handle: BindMountSandboxHandle = {
+        ...base,
+        exec: async (command, options) => {
+          execCommands.push(command);
+          return base.exec(command, options);
+        },
+        copyFileOut: async () => {
+          throw new Error("copyFileOut must not be used — tmpfs is unreadable");
+        },
+      };
+
+      const provider = claudeCode("claude-opus-4-8", {
+        sessionStorage: {
+          hostProjectsDir: hostDir,
+          sandboxProjectsDir: sandboxDir,
+        },
+      });
+
+      await provider.sessionStorage!.captureToHost({
+        hostCwd,
+        sandboxCwd,
+        sessionId: id,
+        handle,
+      });
+
+      const captured = await readFile(
+        join(hostDir, "-host-repo", `${id}.jsonl`),
+        "utf-8",
+      );
+      expect(JSON.parse(captured).marker).toBe(marker);
+      expect(execCommands.some((c) => c.startsWith("base64 <"))).toBe(true);
+    } finally {
+      await rm(hostDir, { recursive: true, force: true });
+      await rm(sandboxDir, { recursive: true, force: true });
+    }
+  });
+
   it("claudeCode captureToHost copies subagent/workflow logs alongside the main session with cwd rewritten", async () => {
     const hostDir = await mkdtemp(
       join(tmpdir(), "sandcastle-claude-sub-many-"),
@@ -2508,7 +2634,7 @@ describe("sessionStorage", () => {
         join(sandboxSubagentsDir, "agent-good.jsonl"),
         JSON.stringify({ type: "system", cwd: sandboxCwd, agent: "good" }),
       );
-      // Bad subagent: enumerated by find but fails on read (copyFileOut).
+      // Bad subagent: enumerated by find but fails on read (base64 exec).
       await writeFile(
         join(sandboxSubagentsDir, "agent-bad.jsonl"),
         JSON.stringify({ type: "system", cwd: sandboxCwd, agent: "bad" }),
@@ -2527,15 +2653,21 @@ describe("sessionStorage", () => {
       };
 
       try {
-        // Decorate the fs handle: make copyFileOut fail for the bad subagent.
+        // Decorate the fs handle: the session read now runs `base64 <path>`
+        // over exec, so fail that exec for the bad subagent (non-zero exit is
+        // what readSandboxFile throws on).
         const base = fsBindMountHandle();
         const handle: BindMountSandboxHandle = {
           ...base,
-          copyFileOut: async (sandboxPath, destPath) => {
-            if (sandboxPath.endsWith("agent-bad.jsonl")) {
-              throw new Error("simulated copyFileOut failure");
+          exec: async (command, options) => {
+            if (command.includes("agent-bad.jsonl")) {
+              return {
+                stdout: "",
+                stderr: "simulated base64 read failure",
+                exitCode: 1,
+              };
             }
-            return base.copyFileOut(sandboxPath, destPath);
+            return base.exec(command, options);
           },
         };
 

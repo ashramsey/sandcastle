@@ -1,15 +1,33 @@
 import { NodeContext } from "@effect/platform-node";
 import { Effect } from "effect";
+import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveEnv } from "./EnvResolver.js";
 
 const makeDir = () => mkdtemp(join(tmpdir(), "env-resolver-"));
 
+/** Init a git repo and commit `.sandcastle/.env` so it reads as tracked. */
+const makeGitRepoWithCommittedEnv = async (contents: string) => {
+  const dir = await makeDir();
+  execFileSync("git", ["-C", dir, "init", "-q"]);
+  execFileSync("git", ["-C", dir, "config", "user.email", "t@t.dev"]);
+  execFileSync("git", ["-C", dir, "config", "user.name", "t"]);
+  await mkdir(join(dir, ".sandcastle"));
+  await writeFile(join(dir, ".sandcastle", ".env"), contents);
+  execFileSync("git", ["-C", dir, "add", "-f", ".sandcastle/.env"]);
+  execFileSync("git", ["-C", dir, "commit", "-q", "-m", "add env"]);
+  return dir;
+};
+
 const runResolveEnv = (dir: string) =>
   Effect.runPromise(resolveEnv(dir).pipe(Effect.provide(NodeContext.layer)));
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("resolveEnv", () => {
   it("returns all key-value pairs from .sandcastle/.env", async () => {
@@ -201,10 +219,7 @@ describe("resolveEnv", () => {
   it("unescapes \\n in double-quoted values", async () => {
     const dir = await makeDir();
     await mkdir(join(dir, ".sandcastle"));
-    await writeFile(
-      join(dir, ".sandcastle", ".env"),
-      'KEY="line1\\nline2"\n',
-    );
+    await writeFile(join(dir, ".sandcastle", ".env"), 'KEY="line1\\nline2"\n');
 
     const env = await runResolveEnv(dir);
     expect(env["KEY"]).toBe("line1\nline2");
@@ -213,10 +228,7 @@ describe("resolveEnv", () => {
   it("does not unescape \\n in single-quoted values", async () => {
     const dir = await makeDir();
     await mkdir(join(dir, ".sandcastle"));
-    await writeFile(
-      join(dir, ".sandcastle", ".env"),
-      "KEY='line1\\nline2'\n",
-    );
+    await writeFile(join(dir, ".sandcastle", ".env"), "KEY='line1\\nline2'\n");
 
     const env = await runResolveEnv(dir);
     expect(env["KEY"]).toBe("line1\\nline2");
@@ -225,10 +237,7 @@ describe("resolveEnv", () => {
   it("preserves internal whitespace in double-quoted values", async () => {
     const dir = await makeDir();
     await mkdir(join(dir, ".sandcastle"));
-    await writeFile(
-      join(dir, ".sandcastle", ".env"),
-      'KEY="  spaced  "\n',
-    );
+    await writeFile(join(dir, ".sandcastle", ".env"), 'KEY="  spaced  "\n');
 
     const env = await runResolveEnv(dir);
     expect(env["KEY"]).toBe("  spaced  ");
@@ -251,10 +260,7 @@ describe("resolveEnv", () => {
   it("handles escaped backslash before n in double-quoted values", async () => {
     const dir = await makeDir();
     await mkdir(join(dir, ".sandcastle"));
-    await writeFile(
-      join(dir, ".sandcastle", ".env"),
-      'KEY="a\\\\nb"\n',
-    );
+    await writeFile(join(dir, ".sandcastle", ".env"), 'KEY="a\\\\nb"\n');
 
     const env = await runResolveEnv(dir);
     // \\n in the file → literal backslash + literal n (not a newline)
@@ -268,5 +274,67 @@ describe("resolveEnv", () => {
 
     const env = await runResolveEnv(dir);
     expect(env["KEY"]).toBe("plain");
+  });
+
+  describe("committed .sandcastle/.env host-env siphon (h04)", () => {
+    it("does NOT import a host value for an undeclared key named in a committed .env", async () => {
+      const dir = await makeGitRepoWithCommittedEnv("AWS_SECRET_ACCESS_KEY=\n");
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const orig = process.env["AWS_SECRET_ACCESS_KEY"];
+      try {
+        process.env["AWS_SECRET_ACCESS_KEY"] = "host-secret";
+        const env = await runResolveEnv(dir);
+        // The siphon is closed: the host value must not reach the container.
+        expect(env["AWS_SECRET_ACCESS_KEY"]).toBeUndefined();
+      } finally {
+        if (orig === undefined) delete process.env["AWS_SECRET_ACCESS_KEY"];
+        else process.env["AWS_SECRET_ACCESS_KEY"] = orig;
+      }
+    });
+
+    it("warns when a committed .env attempts to siphon a host value", async () => {
+      const dir = await makeGitRepoWithCommittedEnv("AWS_SECRET_ACCESS_KEY=\n");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const orig = process.env["AWS_SECRET_ACCESS_KEY"];
+      try {
+        process.env["AWS_SECRET_ACCESS_KEY"] = "host-secret";
+        await runResolveEnv(dir);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls[0]![0]).toContain("AWS_SECRET_ACCESS_KEY");
+        // The host value must never be echoed into the warning.
+        expect(warn.mock.calls[0]![0]).not.toContain("host-secret");
+      } finally {
+        if (orig === undefined) delete process.env["AWS_SECRET_ACCESS_KEY"];
+        else process.env["AWS_SECRET_ACCESS_KEY"] = orig;
+      }
+    });
+
+    it("still passes explicit values from a committed .env (no host data involved)", async () => {
+      const dir = await makeGitRepoWithCommittedEnv("PUBLIC_FLAG=on\n");
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const env = await runResolveEnv(dir);
+      expect(env["PUBLIC_FLAG"]).toBe("on");
+    });
+
+    it("honest path unchanged: an untracked (local) .env still falls back to process.env", async () => {
+      // A git repo, but .sandcastle/.env is NOT committed → local user config.
+      const dir = await makeDir();
+      execFileSync("git", ["-C", dir, "init", "-q"]);
+      await mkdir(join(dir, ".sandcastle"));
+      await writeFile(join(dir, ".sandcastle", ".env"), "MY_TOKEN=\n");
+
+      const orig = process.env["MY_TOKEN"];
+      try {
+        process.env["MY_TOKEN"] = "from-process";
+        const env = await runResolveEnv(dir);
+        expect(env["MY_TOKEN"]).toBe("from-process");
+      } finally {
+        if (orig === undefined) delete process.env["MY_TOKEN"];
+        else process.env["MY_TOKEN"] = orig;
+      }
+    });
   });
 });

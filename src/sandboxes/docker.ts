@@ -16,7 +16,10 @@ import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { Effect } from "effect";
 import { startContainer, removeContainer } from "../DockerLifecycle.js";
-import type { RunHardeningOptions } from "../runHardening.js";
+import {
+  resolveReadOnlyConfigEnv,
+  type RunHardeningOptions,
+} from "../runHardening.js";
 import {
   createBindMountSandboxProvider,
   type SandboxProvider,
@@ -34,6 +37,7 @@ import {
 } from "../mountUtils.js";
 import { BoundedTail, MAX_TAIL_CHARS } from "../boundedTail.js";
 import { registerShutdown } from "../shutdownRegistry.js";
+import { assertHostAccessAcknowledged } from "./hostAccessGate.js";
 
 export interface DockerOptions {
   /** Docker image name (default: derived from repo directory name). */
@@ -74,7 +78,19 @@ export interface DockerOptions {
    * - `"my-network"` → `--network my-network`
    * - `["net1", "net2"]` → `--network net1 --network net2`
    *
-   * When omitted, Docker's default bridge network is used.
+   * When omitted, Docker's default bridge network is used — which NATs
+   * outbound traffic, so the agent reaches `api.anthropic.com`, git hosts,
+   * and package registries out of the box. This is also the **egress-control
+   * lever**: route the container through a filtering-proxy / internal network
+   * to allowlist only the agent's real endpoints, or use `"none"` for a fully
+   * offline run (no model calls, installs, or remote git). See the README's
+   * "Secret redaction / egress" section.
+   *
+   * ⚠️ `network: "host"` shares the **host's** network namespace, letting the
+   * agent reach host-bound services (localhost daemons, cloud metadata
+   * endpoints, sibling containers). It is a host-access escape hatch and
+   * requires {@link DockerOptions.allowDangerousHostAccess}. Custom networks
+   * and `"none"` are **not** gated.
    */
   readonly network?: string | readonly string[];
   /**
@@ -86,8 +102,11 @@ export interface DockerOptions {
    * - `[999]` → `--group-add 999`
    * - `["docker", 999]` → `--group-add docker --group-add 999`
    *
-   * Useful for granting access to a bind-mounted Docker socket (Docker-outside-of-Docker).
-   * When omitted, no `--group-add` flags are added.
+   * ⚠️ Host-access escape hatch. Adding the agent to a host group (e.g.
+   * `docker`, to reach a bind-mounted Docker socket for Docker-outside-of-
+   * Docker) grants host-level privilege and requires
+   * {@link DockerOptions.allowDangerousHostAccess}. When omitted, no
+   * `--group-add` flags are added.
    */
   readonly groups?: readonly (string | number)[];
   /**
@@ -99,7 +118,10 @@ export interface DockerOptions {
    * - `["/dev/sda:/dev/xvda:rwm"]` → `--device /dev/sda:/dev/xvda:rwm`
    * - `["/dev/kvm", "/dev/fuse"]` → `--device /dev/kvm --device /dev/fuse`
    *
-   * When omitted, no `--device` flags are added.
+   * ⚠️ Host-access escape hatch. Exposing a host device hands the agent direct
+   * access to host hardware and requires
+   * {@link DockerOptions.allowDangerousHostAccess}. When omitted, no
+   * `--device` flags are added.
    */
   readonly devices?: readonly string[];
   /**
@@ -125,10 +147,37 @@ export interface DockerOptions {
   /**
    * Privilege- and resource-hardening flags for the container run line. Every
    * field defaults to a hardened value (`--cap-drop=ALL`, `--security-opt
-   * no-new-privileges`, `--pids-limit 2048`); `--memory` is opt-in with no
-   * default. Omit to accept the hardened defaults. See {@link RunHardeningOptions}.
+   * no-new-privileges`, `--pids-limit 2048`, `--read-only` rootfs with `--tmpfs`
+   * for the paths a real agent writes); `--memory` is opt-in with no default.
+   * Omit to accept the hardened defaults. See {@link RunHardeningOptions}.
+   *
+   * With the default read-only rootfs, this provider also relocates the two
+   * config files that live at the read-only home-dir root onto writable tmpfs:
+   * `CLAUDE_CONFIG_DIR` -> the `~/.claude` tmpfs (normally `~/.claude.json`), and
+   * `GIT_CONFIG_GLOBAL` -> a file in the `~/.config` tmpfs (normally
+   * `~/.gitconfig`, written by Sandcastle's `git config --global` setup). Each
+   * relocation is applied only while its backing tmpfs dir is in
+   * `hardening.tmpfs`, so replacing that set without keeping `~/.claude` /
+   * `~/.config` drops the relocation too. Set either var via
+   * {@link DockerOptions.env} to override.
    */
   readonly hardening?: RunHardeningOptions;
+  /**
+   * Acknowledge that the configured host-access escape hatch(es) grant the
+   * agent host-level access, unlocking them.
+   *
+   * The escape hatches — `network: "host"`, {@link DockerOptions.groups},
+   * {@link DockerOptions.devices}, and mounting the Docker socket via
+   * {@link DockerOptions.mounts} — are legitimate opt-in features (GPU access,
+   * Docker-outside-of-Docker) but each punches a hole in the container
+   * boundary. Setting any of them **without** this flag throws at construction,
+   * so host access is never granted by accident. Set to `true` only when you
+   * intend that access and trust the workload: a prompt-injected agent could
+   * use these hatches to reach or take over the host.
+   *
+   * @default false
+   */
+  readonly allowDangerousHostAccess?: boolean;
 }
 
 /**
@@ -136,8 +185,13 @@ export interface DockerOptions {
  *
  * The returned provider creates Docker containers with bind-mounts
  * for the worktree and git directories.
+ *
+ * @throws if a host-access escape hatch (`network: "host"`, `groups`,
+ * `devices`, or a Docker-socket mount) is set without
+ * {@link DockerOptions.allowDangerousHostAccess}.
  */
 export const docker = (options?: DockerOptions): SandboxProvider => {
+  assertHostAccessAcknowledged("docker", options ?? {});
   const configuredImageName = options?.imageName;
   const selinuxLabel = options?.selinuxLabel ?? "z";
   const maxOutputTailChars = options?.maxOutputTailChars ?? MAX_TAIL_CHARS;
@@ -184,12 +238,17 @@ export const docker = (options?: DockerOptions): SandboxProvider => {
       // Pre-flight: verify image exists and UID matches
       await checkImageUid(imageName, containerUid);
 
-      // Start container
+      // Under the default read-only rootfs, relocate the two config FILES that
+      // live at the home-dir root (which no directory `--tmpfs` can cover) onto
+      // a writable tmpfs via env — but only for a file whose backing tmpfs dir
+      // is actually mounted (see resolveReadOnlyConfigEnv). Spread first so the
+      // caller's env wins if it sets either variable itself.
       await Effect.runPromise(
         startContainer(
           containerName,
           imageName,
           {
+            ...resolveReadOnlyConfigEnv(options?.hardening),
             ...createOptions.env,
             HOME: "/home/agent",
           },

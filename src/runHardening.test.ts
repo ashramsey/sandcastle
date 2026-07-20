@@ -1,10 +1,24 @@
 import { describe, expect, it } from "vitest";
-import { resolveHardeningFlags, DEFAULT_PIDS_LIMIT } from "./runHardening.js";
+import {
+  resolveHardeningFlags,
+  resolveReadOnlyConfigEnv,
+  DEFAULT_PIDS_LIMIT,
+  DEFAULT_TMPFS,
+} from "./runHardening.js";
 
 /** Read the value following `flag` in a flat arg array (undefined if absent). */
 const valueAfter = (args: string[], flag: string): string | undefined => {
   const idx = args.indexOf(flag);
   return idx === -1 ? undefined : args[idx + 1];
+};
+
+/** All values following each occurrence of `flag` in a flat arg array. */
+const valuesAfter = (args: string[], flag: string): string[] => {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === flag) out.push(args[i + 1]!);
+  }
+  return out;
 };
 
 describe("resolveHardeningFlags", () => {
@@ -33,6 +47,54 @@ describe("resolveHardeningFlags", () => {
 
     it("does not set a memory limit by default", () => {
       expect(flags).not.toContain("--memory");
+    });
+
+    it("mounts the rootfs read-only by default", () => {
+      expect(flags).toContain("--read-only");
+    });
+
+    it("emits a --tmpfs for each default writable path", () => {
+      expect(valuesAfter(flags, "--tmpfs")).toEqual([...DEFAULT_TMPFS]);
+    });
+
+    it("does not shadow the home dir (CLI baked into ~/.local)", () => {
+      expect(valuesAfter(flags, "--tmpfs")).not.toContain("/home/agent");
+    });
+  });
+
+  describe("read-only rootfs override", () => {
+    it("omits --read-only and the default tmpfs when disabled", () => {
+      const flags = resolveHardeningFlags({ readOnlyRootfs: false });
+      expect(flags).not.toContain("--read-only");
+      expect(flags).not.toContain("--tmpfs");
+    });
+
+    it("honors an explicit tmpfs even when read-only is disabled", () => {
+      const flags = resolveHardeningFlags({
+        readOnlyRootfs: false,
+        tmpfs: ["/scratch"],
+      });
+      expect(flags).not.toContain("--read-only");
+      expect(valuesAfter(flags, "--tmpfs")).toEqual(["/scratch"]);
+    });
+  });
+
+  describe("tmpfs override", () => {
+    it("replaces the default set, preserving order and raw specs", () => {
+      const flags = resolveHardeningFlags({
+        tmpfs: ["/tmp:exec", "/home/agent/.cache"],
+      });
+      expect(flags).toContain("--read-only");
+      expect(valuesAfter(flags, "--tmpfs")).toEqual([
+        "/tmp:exec",
+        "/home/agent/.cache",
+      ]);
+    });
+
+    it("mounts no tmpfs when set to an empty array", () => {
+      const flags = resolveHardeningFlags({ tmpfs: [] });
+      expect(flags).toContain("--read-only");
+      expect(flags).not.toContain("--tmpfs");
     });
   });
 
@@ -86,5 +148,36 @@ describe("resolveHardeningFlags", () => {
       const flags = resolveHardeningFlags({ memory: "8g" });
       expect(valueAfter(flags, "--memory")).toBe("8g");
     });
+  });
+});
+
+describe("resolveReadOnlyConfigEnv", () => {
+  it("relocates both config files by default (read-only rootfs + default tmpfs)", () => {
+    expect(resolveReadOnlyConfigEnv()).toEqual({
+      CLAUDE_CONFIG_DIR: "/home/agent/.claude",
+      GIT_CONFIG_GLOBAL: "/home/agent/.config/gitconfig",
+    });
+  });
+
+  it("emits nothing when the rootfs is writable", () => {
+    expect(resolveReadOnlyConfigEnv({ readOnlyRootfs: false })).toEqual({});
+  });
+
+  it("drops a relocation whose backing tmpfs dir is not mounted", () => {
+    // A caller who replaces tmpfs and keeps neither ~/.claude nor ~/.config
+    // must not get env vars pointing config at the now-read-only rootfs.
+    expect(resolveReadOnlyConfigEnv({ tmpfs: ["/tmp"] })).toEqual({});
+  });
+
+  it("relocates only the file whose tmpfs dir survives a partial override", () => {
+    expect(
+      resolveReadOnlyConfigEnv({ tmpfs: ["/home/agent/.config:mode=1777"] }),
+    ).toEqual({ GIT_CONFIG_GLOBAL: "/home/agent/.config/gitconfig" });
+  });
+
+  it("matches a bare tmpfs dir spec without mount options", () => {
+    expect(
+      resolveReadOnlyConfigEnv({ tmpfs: ["/home/agent/.claude"] }),
+    ).toEqual({ CLAUDE_CONFIG_DIR: "/home/agent/.claude" });
   });
 });

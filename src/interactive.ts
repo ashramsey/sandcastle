@@ -39,7 +39,7 @@ import {
   findMissingPromptArgKeys,
   BUILT_IN_PROMPT_ARG_KEYS,
 } from "./PromptArgumentSubstitution.js";
-import { noSandbox } from "./sandboxes/no-sandbox.js";
+import { requireExplicitSandbox } from "./requireExplicitSandbox.js";
 import { raceAbortSignal } from "./raceAbortSignal.js";
 import { resolveCwd } from "./resolveCwd.js";
 import type { Timeouts } from "./run.js";
@@ -47,7 +47,13 @@ import type { Timeouts } from "./run.js";
 export interface InteractiveOptions {
   /** Agent provider to use (e.g. claudeCode("claude-opus-4-8")) */
   readonly agent: AgentProvider;
-  /** Sandbox provider (e.g. docker(), noSandbox()). */
+  /**
+   * Sandbox provider (e.g. `docker()`, `noSandbox()`).
+   *
+   * Required — there is no silent default. Pass a real provider to sandbox the
+   * agent, or an explicit `noSandbox()` to deliberately run it on the host.
+   * Omitting it throws.
+   */
   readonly sandbox?: AnySandboxProvider;
   /** Inline prompt string (mutually exclusive with promptFile). */
   readonly prompt?: string;
@@ -119,7 +125,10 @@ export const interactive = async (
 
   const { prompt, promptFile, hooks, agent: provider } = options;
 
-  const resolvedSandbox = options.sandbox ?? noSandbox();
+  const resolvedSandbox = requireExplicitSandbox(
+    options.sandbox,
+    "interactive()",
+  );
 
   // Derive branch strategy
   const branchStrategy: BranchStrategy =
