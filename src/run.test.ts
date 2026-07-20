@@ -24,6 +24,7 @@ import {
   type RunResult,
 } from "./run.js";
 import { createSecretRedactor } from "./redactSecrets.js";
+import type { AgentStreamEvent } from "./AgentStreamEmitter.js";
 import { claudeCode, cursor, opencode } from "./AgentProvider.js";
 import { Output, StructuredOutputError } from "./Output.js";
 import { claudeHostSessionPath } from "./SessionStore.js";
@@ -1554,5 +1555,76 @@ describe("buildAgentStreamHandler verbose-sink redaction (h07)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("buildAgentStreamHandler onAgentStreamEvent redaction (h07)", () => {
+  const secret = "sk-ant-supersecrettoken-0123456789";
+
+  it("masks the secret in each event field before the user callback", () => {
+    const received: AgentStreamEvent[] = [];
+    const handler = buildAgentStreamHandler(
+      {
+        type: "file",
+        path: "unused.log",
+        onAgentStreamEvent: (e) => received.push(e),
+      },
+      createSecretRedactor([secret]),
+    );
+    const ts = new Date();
+    handler!({
+      type: "text",
+      message: `here it is: ${secret}`,
+      iteration: 1,
+      timestamp: ts,
+    });
+    handler!({
+      type: "toolCall",
+      name: "Bash",
+      formattedArgs: `curl -H "authorization: Bearer ${secret}"`,
+      iteration: 1,
+      timestamp: ts,
+    });
+    handler!({
+      type: "raw",
+      line: `raw ${secret}`,
+      iteration: 1,
+      timestamp: ts,
+    });
+
+    expect(received).toEqual([
+      {
+        type: "text",
+        message: "here it is: [redacted]",
+        iteration: 1,
+        timestamp: ts,
+      },
+      {
+        type: "toolCall",
+        name: "Bash",
+        formattedArgs: 'curl -H "authorization: Bearer [redacted]"',
+        iteration: 1,
+        timestamp: ts,
+      },
+      { type: "raw", line: "raw [redacted]", iteration: 1, timestamp: ts },
+    ]);
+  });
+
+  it("forwards events unchanged when no redactor is supplied", () => {
+    const received: AgentStreamEvent[] = [];
+    const handler = buildAgentStreamHandler({
+      type: "file",
+      path: "unused.log",
+      onAgentStreamEvent: (e) => received.push(e),
+    });
+    const event: AgentStreamEvent = {
+      type: "text",
+      message: "nothing secret here",
+      iteration: 1,
+      timestamp: new Date(),
+    };
+    handler!(event);
+
+    expect(received).toEqual([event]);
   });
 });

@@ -16,7 +16,10 @@ import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { Effect } from "effect";
 import { startContainer, removeContainer } from "../DockerLifecycle.js";
-import type { RunHardeningOptions } from "../runHardening.js";
+import {
+  resolveReadOnlyConfigEnv,
+  type RunHardeningOptions,
+} from "../runHardening.js";
 import {
   createBindMountSandboxProvider,
   type SandboxProvider,
@@ -152,8 +155,11 @@ export interface DockerOptions {
    * config files that live at the read-only home-dir root onto writable tmpfs:
    * `CLAUDE_CONFIG_DIR` -> the `~/.claude` tmpfs (normally `~/.claude.json`), and
    * `GIT_CONFIG_GLOBAL` -> a file in the `~/.config` tmpfs (normally
-   * `~/.gitconfig`, written by Sandcastle's `git config --global` setup). Set
-   * either via {@link DockerOptions.env} to override.
+   * `~/.gitconfig`, written by Sandcastle's `git config --global` setup). Each
+   * relocation is applied only while its backing tmpfs dir is in
+   * `hardening.tmpfs`, so replacing that set without keeping `~/.claude` /
+   * `~/.config` drops the relocation too. Set either var via
+   * {@link DockerOptions.env} to override.
    */
   readonly hardening?: RunHardeningOptions;
   /**
@@ -232,30 +238,17 @@ export const docker = (options?: DockerOptions): SandboxProvider => {
       // Pre-flight: verify image exists and UID matches
       await checkImageUid(imageName, containerUid);
 
-      // Under the default read-only rootfs, two config files at the home-dir
-      // root can't be written and no directory `--tmpfs` can cover them:
-      //  - Claude's `~/.claude.json` -> point CLAUDE_CONFIG_DIR at the `~/.claude`
-      //    tmpfs dir.
-      //  - git's `~/.gitconfig` (written by Sandcastle's own `git config --global`
-      //    for safe.directory + user.name/email) -> point GIT_CONFIG_GLOBAL at a
-      //    file inside the `~/.config` tmpfs. It must sit directly in an existing
-      //    tmpfs mount root because `git config` won't create missing parents.
-      // Both land the state on a writable mount; the caller's env wins if it sets
-      // either variable itself.
-      const readOnlyRootfs = options?.hardening?.readOnlyRootfs ?? true;
-
-      // Start container
+      // Under the default read-only rootfs, relocate the two config FILES that
+      // live at the home-dir root (which no directory `--tmpfs` can cover) onto
+      // a writable tmpfs via env — but only for a file whose backing tmpfs dir
+      // is actually mounted (see resolveReadOnlyConfigEnv). Spread first so the
+      // caller's env wins if it sets either variable itself.
       await Effect.runPromise(
         startContainer(
           containerName,
           imageName,
           {
-            ...(readOnlyRootfs
-              ? {
-                  CLAUDE_CONFIG_DIR: "/home/agent/.claude",
-                  GIT_CONFIG_GLOBAL: "/home/agent/.config/gitconfig",
-                }
-              : {}),
+            ...resolveReadOnlyConfigEnv(options?.hardening),
             ...createOptions.env,
             HOME: "/home/agent",
           },

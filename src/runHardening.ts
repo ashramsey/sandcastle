@@ -44,6 +44,38 @@ export const DEFAULT_TMPFS = [
   "/home/agent/.claude:mode=1777",
 ] as const;
 
+/**
+ * Config FILES that live at the read-only home-dir root and so can't be covered
+ * by a directory `--tmpfs`. Each is relocated onto a writable tmpfs via an env
+ * var — but only when the tmpfs mount it depends on is actually present (see
+ * {@link resolveReadOnlyConfigEnv}).
+ */
+const READ_ONLY_CONFIG_RELOCATIONS = [
+  {
+    // Claude writes `~/.claude.json` at the home root; point its config dir at
+    // the `~/.claude` tmpfs so the config (incl. `.credentials.json`) lands on a
+    // writable mount.
+    env: "CLAUDE_CONFIG_DIR",
+    value: "/home/agent/.claude",
+    tmpfsDir: "/home/agent/.claude",
+  },
+  {
+    // git's `~/.gitconfig` (written by Sandcastle's own `git config --global`
+    // for safe.directory + user.name/email). GIT_CONFIG_GLOBAL must name a FILE
+    // inside an existing tmpfs mount ROOT because `git config` won't create
+    // missing parent dirs.
+    env: "GIT_CONFIG_GLOBAL",
+    value: "/home/agent/.config/gitconfig",
+    tmpfsDir: "/home/agent/.config",
+  },
+] as const;
+
+/** Directory a `--tmpfs` spec mounts, i.e. the spec with any `:options` suffix stripped. */
+const tmpfsMountDir = (spec: string): string => {
+  const colon = spec.indexOf(":");
+  return colon === -1 ? spec : spec.slice(0, colon);
+};
+
 export interface RunHardeningOptions {
   /**
    * Linux capabilities to drop, via `--cap-drop`.
@@ -104,10 +136,53 @@ export interface RunHardeningOptions {
    * Docker/Podman providers therefore relocate them via env: `CLAUDE_CONFIG_DIR`
    * -> `~/.claude` (for `~/.claude.json`) and `GIT_CONFIG_GLOBAL` -> a file in
    * `~/.config` (for `~/.gitconfig`, written by Sandcastle's `git config
-   * --global` setup) — both landing on a writable tmpfs mount.
+   * --global` setup) — both landing on a writable tmpfs mount. That relocation
+   * follows this set: it is only applied for a file whose backing tmpfs dir
+   * (`~/.claude`, `~/.config`) is actually mounted here, so if you replace this
+   * array you must keep those dirs (or point the agent's config elsewhere via
+   * env) or the agent's config/git writes will hit the read-only rootfs.
    */
   readonly tmpfs?: readonly string[];
 }
+
+/**
+ * The effective `--tmpfs` set for these options: the caller's explicit `tmpfs`
+ * when set, otherwise {@link DEFAULT_TMPFS} under a read-only rootfs (and
+ * nothing when the rootfs is writable, since the default set exists only to make
+ * a read-only rootfs usable). Single source of truth shared by
+ * {@link resolveHardeningFlags} and {@link resolveReadOnlyConfigEnv}.
+ */
+export const resolveTmpfs = (
+  options?: RunHardeningOptions,
+): readonly string[] => {
+  const readOnlyRootfs = options?.readOnlyRootfs ?? true;
+  return options?.tmpfs ?? (readOnlyRootfs ? DEFAULT_TMPFS : []);
+};
+
+/**
+ * Env that relocates the home-root config FILES onto writable tmpfs under a
+ * read-only rootfs. Emitted per file ONLY when the tmpfs mount that file depends
+ * on is actually in the resolved {@link resolveTmpfs} set — so a caller who
+ * replaces `tmpfs` and drops `~/.claude` / `~/.config` does not get an env var
+ * left pointing config at a now-read-only path (the relocation follows the
+ * tmpfs, instead of being keyed on `readOnlyRootfs` alone). Empty when the
+ * rootfs is writable.
+ *
+ * The Docker/Podman providers spread this BEFORE the caller's `env`, so a
+ * caller-set `CLAUDE_CONFIG_DIR` / `GIT_CONFIG_GLOBAL` always wins.
+ */
+export const resolveReadOnlyConfigEnv = (
+  options?: RunHardeningOptions,
+): Record<string, string> => {
+  const readOnlyRootfs = options?.readOnlyRootfs ?? true;
+  if (!readOnlyRootfs) return {};
+  const mountDirs = new Set(resolveTmpfs(options).map(tmpfsMountDir));
+  const env: Record<string, string> = {};
+  for (const { env: key, value, tmpfsDir } of READ_ONLY_CONFIG_RELOCATIONS) {
+    if (mountDirs.has(tmpfsDir)) env[key] = value;
+  }
+  return env;
+};
 
 /**
  * Resolve the hardened run-line flags into a flat `run` argument array,
@@ -121,10 +196,7 @@ export const resolveHardeningFlags = (
   const noNewPrivileges = options?.noNewPrivileges ?? true;
   const pidsLimit = options?.pidsLimit ?? DEFAULT_PIDS_LIMIT;
   const readOnlyRootfs = options?.readOnlyRootfs ?? true;
-  // The default tmpfs set exists only to make a read-only rootfs usable, so it
-  // applies only when the rootfs is read-only; an explicit `tmpfs` is honored
-  // regardless.
-  const tmpfs = options?.tmpfs ?? (readOnlyRootfs ? DEFAULT_TMPFS : []);
+  const tmpfs = resolveTmpfs(options);
 
   const flags: string[] = [];
   for (const cap of capDrop) flags.push("--cap-drop", cap);

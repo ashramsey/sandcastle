@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   resolveHardeningFlags,
+  resolveReadOnlyConfigEnv,
   DEFAULT_PIDS_LIMIT,
   DEFAULT_TMPFS,
 } from "./runHardening.js";
@@ -147,5 +148,36 @@ describe("resolveHardeningFlags", () => {
       const flags = resolveHardeningFlags({ memory: "8g" });
       expect(valueAfter(flags, "--memory")).toBe("8g");
     });
+  });
+});
+
+describe("resolveReadOnlyConfigEnv", () => {
+  it("relocates both config files by default (read-only rootfs + default tmpfs)", () => {
+    expect(resolveReadOnlyConfigEnv()).toEqual({
+      CLAUDE_CONFIG_DIR: "/home/agent/.claude",
+      GIT_CONFIG_GLOBAL: "/home/agent/.config/gitconfig",
+    });
+  });
+
+  it("emits nothing when the rootfs is writable", () => {
+    expect(resolveReadOnlyConfigEnv({ readOnlyRootfs: false })).toEqual({});
+  });
+
+  it("drops a relocation whose backing tmpfs dir is not mounted", () => {
+    // A caller who replaces tmpfs and keeps neither ~/.claude nor ~/.config
+    // must not get env vars pointing config at the now-read-only rootfs.
+    expect(resolveReadOnlyConfigEnv({ tmpfs: ["/tmp"] })).toEqual({});
+  });
+
+  it("relocates only the file whose tmpfs dir survives a partial override", () => {
+    expect(
+      resolveReadOnlyConfigEnv({ tmpfs: ["/home/agent/.config:mode=1777"] }),
+    ).toEqual({ GIT_CONFIG_GLOBAL: "/home/agent/.config/gitconfig" });
+  });
+
+  it("matches a bare tmpfs dir spec without mount options", () => {
+    expect(
+      resolveReadOnlyConfigEnv({ tmpfs: ["/home/agent/.claude"] }),
+    ).toEqual({ CLAUDE_CONFIG_DIR: "/home/agent/.claude" });
   });
 });

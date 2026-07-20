@@ -229,8 +229,10 @@ export type LoggingOption =
        * Optional callback invoked for each agent stream event (text chunk,
        * tool call, or raw stdout line) in addition to being written to the
        * log file. Intended for forwarding the agent's output stream to
-       * external observability systems. Errors thrown by the callback are
-       * swallowed.
+       * external observability systems. Known secret values (injected
+       * credentials + declared secrets) are masked in the event's text before
+       * it reaches the callback, matching the on-disk log redaction (h07).
+       * Errors thrown by the callback are swallowed.
        */
       readonly onAgentStreamEvent?: (event: AgentStreamEvent) => void;
       /**
@@ -282,7 +284,11 @@ export const buildAgentStreamHandler = (
   return (event) => {
     if (userHandler) {
       try {
-        userHandler(event);
+        // Mask secrets before the event leaves Sandcastle: this callback
+        // forwards the agent's output stream to the caller's own observability
+        // sink, where an injected token would otherwise be persisted in the
+        // clear — the same leak (h07) the verbose sink is redacted against.
+        userHandler(redactStreamEvent(event, redact));
       } catch {
         // Swallow — a broken forwarder must not stop the verbose sink.
       }
@@ -291,6 +297,26 @@ export const buildAgentStreamHandler = (
       verboseSink(event.line);
     }
   };
+};
+
+/**
+ * Return a copy of an agent stream event with its secret-bearing text field run
+ * through `redact`, leaving shape and metadata (type, iteration, timestamp)
+ * untouched. With the identity redactor (no declared secrets) the field value is
+ * unchanged, so the forwarded event is equivalent to the original.
+ */
+const redactStreamEvent = (
+  event: AgentStreamEvent,
+  redact: Redactor,
+): AgentStreamEvent => {
+  switch (event.type) {
+    case "text":
+      return { ...event, message: redact(event.message) };
+    case "toolCall":
+      return { ...event, formattedArgs: redact(event.formattedArgs) };
+    case "raw":
+      return { ...event, line: redact(event.line) };
+  }
 };
 
 const buildVerboseRawLineSink = (

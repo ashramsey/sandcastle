@@ -622,6 +622,18 @@ describe("podman()", () => {
       expect(envValue(runArgs, "CLAUDE_CONFIG_DIR")).toBeUndefined();
       expect(envValue(runArgs, "GIT_CONFIG_GLOBAL")).toBeUndefined();
     });
+
+    it("drops the config relocation when a tmpfs override removes its backing mount", async () => {
+      // readOnlyRootfs stays true, but a custom tmpfs set no longer includes
+      // ~/.claude or ~/.config — so we must NOT leave CLAUDE_CONFIG_DIR /
+      // GIT_CONFIG_GLOBAL pointing config at the now-read-only rootfs.
+      const runArgs = await runPodman({
+        hardening: { tmpfs: ["/tmp:mode=1777"] },
+      });
+      expect(runArgs).toContain("--read-only");
+      expect(envValue(runArgs, "CLAUDE_CONFIG_DIR")).toBeUndefined();
+      expect(envValue(runArgs, "GIT_CONFIG_GLOBAL")).toBeUndefined();
+    });
   });
 
   it("passes --group-add flags to podman run, stringifying numeric GIDs", async () => {
